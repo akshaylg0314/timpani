@@ -11,13 +11,37 @@ pub mod proto;
 pub mod sched;
 pub mod signal;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use crate::proto::schedinfo_v1::ScheduledTask;
 use config::Config;
-use context::{Context, SchedInfo, SyncStartTime};
+use context::{Context, SchedInfo, SyncStartTime, TaskInfo};
 use error::{TimpaniError, TimpaniResult};
-use tracing::{debug, error, info};
+use tokio::time::MissedTickBehavior;
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::{fmt::SubscriberBuilder, EnvFilter};
+
+/// How often to re-fetch GetSchedInfo and compare for workload changes.
+const WORKLOAD_POLL_INTERVAL_SECS: u64 = 2;
+
+/// Convert a single proto [`ScheduledTask`] into the domain [`TaskInfo`] type.
+///
+/// Proto uses `int32` for most numeric fields; `.max(0)` guards against
+/// negative wire values before the cast to `u32`.  `cpu_affinity` is
+/// reinterpreted as `u64` (bitmask — the sign bit is a valid CPU index).
+fn task_from_proto(t: &ScheduledTask) -> TaskInfo {
+    TaskInfo {
+        name: t.name.chars().take(16).collect(),
+        sched_policy: t.sched_policy.max(0) as u32,
+        sched_priority: t.sched_priority.max(0) as u32,
+        period_us: t.period_us.max(0) as u32,
+        release_time_us: t.release_time_us.max(0) as u32,
+        runtime_us: t.runtime_us.max(0) as u32,
+        deadline_us: t.deadline_us.max(0) as u32,
+        cpu_affinity: t.cpu_affinity,
+        max_dmiss: t.max_dmiss.max(0) as u32,
+    }
+}
 
 /// Initialize logging with the specified log level.
 ///
@@ -116,14 +140,14 @@ pub async fn run_app(config: Config) -> TimpaniResult<()> {
             }
         }
     };
-    let task_count = sched_resp.tasks.len();
+    let tasks: Vec<TaskInfo> = sched_resp.tasks.iter().map(task_from_proto).collect();
     info!(
         workload_id    = %sched_resp.workload_id,
         hyperperiod_us = sched_resp.hyperperiod_us,
-        task_count,
+        task_count     = tasks.len(),
         "Schedule received from Timpani-O"
     );
-    for (i, task) in sched_resp.tasks.iter().enumerate() {
+    for (i, task) in tasks.iter().enumerate() {
         debug!(
             index         = i,
             name          = %task.name,
@@ -141,7 +165,8 @@ pub async fn run_app(config: Config) -> TimpaniResult<()> {
     let sched_info = SchedInfo {
         workload_id: sched_resp.workload_id,
         hyperperiod_us: sched_resp.hyperperiod_us,
-        task_count,
+        tasks,
+        received_at: Instant::now(),
     };
 
     // 5. SyncTimer — barrier across all active nodes (skipped if enable_sync=false).
@@ -170,11 +195,86 @@ pub async fn run_app(config: Config) -> TimpaniResult<()> {
     ctx.runtime.sync_start = sync_start;
     ctx.comm.node_client = Some(client);
 
-    // 7. RT wait loop.  The timer/task module will replace this with the
-    //    real deadline-driven loop; ReportDMiss will be called from there.
-    info!("Startup complete — waiting for shutdown signal (RT loop not yet implemented)");
-    cancel.cancelled().await;
-    info!("Shutdown signal received — cleaning up");
+    // 7. Workload polling loop.
+    //    Periodically re-fetches the schedule from Timpani-O to detect workload
+    //    changes (new workload_id) or task-parameter updates (same workload_id,
+    //    different tasks).  Versioning is client-side only: NodeSchedResponse has
+    //    no server-side version field, so we do a structural content comparison.
+    //
+    //    On change: logs the event and updates ctx.runtime.sched_info.
+    //    Full teardown + reinit of the RT loop is a TODO pending the task module.
+    //
+    //    NotReady (Timpani-O temporarily has no active workload) → keep running.
+    let node_id = ctx.config.node_id.clone();
+    let mut poll_interval = tokio::time::interval(Duration::from_secs(WORKLOAD_POLL_INTERVAL_SECS));
+    // Skip ticks that were missed while handling a long workload update.
+    poll_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    // Consume the first immediate tick so the first real poll fires after
+    // WORKLOAD_POLL_INTERVAL_SECS, not at t=0 right after startup.
+    poll_interval.tick().await;
+    info!(
+        interval_secs = WORKLOAD_POLL_INTERVAL_SECS,
+        "Startup complete — entering workload watch loop (RT loop pending task module)"
+    );
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                info!("Shutdown signal received — cleaning up");
+                break;
+            }
+            _ = poll_interval.tick() => {
+                // Borrow ctx.comm in its own block so the &mut NodeClient is
+                // released before we borrow ctx.runtime below.
+                let poll_result = {
+                    let client = ctx.comm.node_client.as_mut()
+                        .expect("NodeClient must be present after successful startup");
+                    client.get_sched_info(&node_id).await
+                };
+                match poll_result {
+                    Ok(new_resp) => {
+                        let new_tasks: Vec<TaskInfo> =
+                            new_resp.tasks.iter().map(task_from_proto).collect();
+                        let new_sched = SchedInfo {
+                            workload_id:   new_resp.workload_id,
+                            hyperperiod_us: new_resp.hyperperiod_us,
+                            tasks:         new_tasks,
+                            received_at:   Instant::now(),
+                        };
+                        if let Some(current) = ctx.runtime.sched_info.as_ref() {
+                            if current.content_changed(&new_sched) {
+                                if current.is_full_replacement(&new_sched) {
+                                    info!(
+                                        old_workload = %current.workload_id,
+                                        new_workload = %new_sched.workload_id,
+                                        "Workload replaced — full teardown and reinit (TODO: task module)"
+                                    );
+                                } else {
+                                    info!(
+                                        workload_id    = %new_sched.workload_id,
+                                        old_task_count = current.tasks.len(),
+                                        new_task_count = new_sched.tasks.len(),
+                                        "Workload updated — teardown and reinit (TODO: task module)"
+                                    );
+                                }
+                                // TODO: teardown running tasks, call SyncTimer if full
+                                //       replacement, re-init with new_sched.
+                                ctx.runtime.sched_info = Some(new_sched);
+                            }
+                        }
+                    }
+                    Err(TimpaniError::NotReady) => {
+                        // Timpani-O is alive but has no active workload right now
+                        // (e.g. between submissions).  Keep current schedule running.
+                        debug!("Workload poll: no active workload on Timpani-O — keeping current");
+                    }
+                    Err(e) => {
+                        warn!(error = ?e, "Workload poll failed — retrying next interval");
+                    }
+                }
+            }
+        }
+    }
 
     ctx.cleanup();
     Ok(())

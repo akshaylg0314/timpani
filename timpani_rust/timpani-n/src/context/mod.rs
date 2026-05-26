@@ -3,24 +3,89 @@
  * SPDX-License-Identifier: MIT
  */
 
+use std::time::Instant;
+
 use crate::config::Config;
 use crate::grpc::NodeClient;
 use crate::sched::{set_affinity, set_schedattr, SchedPolicy};
 use nix::unistd::Pid;
 use tracing::{info, warn};
 
-/// Scheduling information received from Timpani-O at startup via GetSchedInfo.
+/// Static scheduling parameters for one task, received from Timpani-O.
 ///
-/// This is a domain type (no proto dependency).  The full task list lives here
-/// temporarily until the task module is implemented and owns it.
+/// Pure domain type — no proto dependency, no runtime state (pid, pidfd).
+/// Those are added by the task module during `init_task_list`.
+///
+/// Mirrors `struct task_info` from schedinfo.h, minus the runtime fields.
+/// Will move to `task/mod.rs` when that module is implemented.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TaskInfo {
+    /// Task name.  At most 16 chars (TINFO_NAME_MAX); truncated at construction.
+    pub name: String,
+    /// Linux scheduling policy (0 = NORMAL, 1 = FIFO, 2 = RR).
+    pub sched_policy: u32,
+    /// Linux real-time scheduling priority (0 for NORMAL, 1–99 for FIFO/RR).
+    pub sched_priority: u32,
+    /// Task period in microseconds.
+    pub period_us: u32,
+    /// Release time offset within the hyperperiod, in microseconds.
+    pub release_time_us: u32,
+    /// Worst-case execution time budget in microseconds.
+    pub runtime_us: u32,
+    /// Relative deadline in microseconds.
+    pub deadline_us: u32,
+    /// CPU affinity bitmask (same bit layout as Linux cpu_set_t).
+    pub cpu_affinity: u64,
+    /// Maximum allowable deadline misses before a fault is reported.
+    pub max_dmiss: u32,
+}
+
+/// Scheduling information received from Timpani-O via GetSchedInfo.
+///
+/// This is a domain type (no proto dependency).  Versioned client-side via
+/// `received_at`: Timpani-N polls GetSchedInfo periodically and compares
+/// content (excluding `received_at`) to detect workload changes.
 #[derive(Debug)]
 pub struct SchedInfo {
-    /// Workload identifier string from Timpani-O.
+    /// Workload identifier.  A change here means full workload replacement.
     pub workload_id: String,
     /// Hyperperiod in microseconds.
     pub hyperperiod_us: u64,
-    /// Number of tasks assigned to this node.
-    pub task_count: usize,
+    /// Tasks assigned to this node.
+    pub tasks: Vec<TaskInfo>,
+    /// Wall-clock time when this schedule version was fetched from Timpani-O.
+    /// Used for logging and staleness tracking only.  Excluded from PartialEq.
+    pub received_at: Instant,
+}
+
+impl PartialEq for SchedInfo {
+    /// Content equality — `received_at` is intentionally excluded.
+    fn eq(&self, other: &Self) -> bool {
+        self.workload_id == other.workload_id
+            && self.hyperperiod_us == other.hyperperiod_us
+            && self.tasks == other.tasks
+    }
+}
+
+impl SchedInfo {
+    /// Returns `true` if the schedule content differs from `other`.
+    ///
+    /// `received_at` is not considered — only `workload_id`, `hyperperiod_us`,
+    /// and `tasks` participate in the comparison.
+    pub fn content_changed(&self, other: &SchedInfo) -> bool {
+        self != other
+    }
+
+    /// Returns `true` if `other` belongs to a completely new workload
+    /// (different `workload_id`) rather than an in-place update.
+    pub fn is_full_replacement(&self, other: &SchedInfo) -> bool {
+        self.workload_id != other.workload_id
+    }
+
+    /// Convenience accessor: number of tasks in this schedule.
+    pub fn task_count(&self) -> usize {
+        self.tasks.len()
+    }
 }
 
 /// Absolute start time returned by SyncTimer when the barrier releases.
@@ -154,6 +219,7 @@ impl Context {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     #[test]
     fn test_context_creation() {
@@ -259,5 +325,76 @@ mod tests {
             Err(e) => panic!("Unexpected error: {:?}", e),
         }
         ctx.cleanup();
+    }
+
+    fn make_task(name: &str, period_us: u32) -> TaskInfo {
+        TaskInfo {
+            name: name.chars().take(16).collect(),
+            sched_policy: 2,
+            sched_priority: 50,
+            period_us,
+            release_time_us: 0,
+            runtime_us: 1000,
+            deadline_us: period_us,
+            cpu_affinity: 0x1,
+            max_dmiss: 0,
+        }
+    }
+
+    fn make_sched(workload_id: &str, tasks: Vec<TaskInfo>) -> SchedInfo {
+        SchedInfo {
+            workload_id: workload_id.to_string(),
+            hyperperiod_us: 100_000,
+            tasks,
+            received_at: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn test_sched_info_equal_content_different_received_at() {
+        let task = make_task("task_a", 10_000);
+        let a = make_sched("wl-1", vec![task.clone()]);
+        // Simulate a later fetch: same content, different received_at.
+        let b = SchedInfo {
+            workload_id: a.workload_id.clone(),
+            hyperperiod_us: a.hyperperiod_us,
+            tasks: a.tasks.clone(),
+            received_at: Instant::now(),
+        };
+        assert_eq!(a, b, "Same content => equal regardless of received_at");
+        assert!(!a.content_changed(&b), "No content change expected");
+    }
+
+    #[test]
+    fn test_sched_info_content_changed_task_param() {
+        let a = make_sched("wl-1", vec![make_task("task_a", 10_000)]);
+        // Same workload_id, but period_us changed.
+        let b = make_sched("wl-1", vec![make_task("task_a", 20_000)]);
+        assert_ne!(a, b);
+        assert!(a.content_changed(&b), "period_us change must be detected");
+        assert!(
+            !a.is_full_replacement(&b),
+            "Same workload_id is not a replacement"
+        );
+    }
+
+    #[test]
+    fn test_sched_info_full_replacement() {
+        let a = make_sched("wl-1", vec![make_task("task_a", 10_000)]);
+        let b = make_sched("wl-2", vec![make_task("task_b", 10_000)]);
+        assert!(a.content_changed(&b));
+        assert!(
+            a.is_full_replacement(&b),
+            "Different workload_id is a full replacement"
+        );
+    }
+
+    #[test]
+    fn test_sched_info_task_count() {
+        let a = make_sched(
+            "wl-1",
+            vec![make_task("t1", 5_000), make_task("t2", 10_000)],
+        );
+        assert_eq!(a.task_count(), 2);
     }
 }
