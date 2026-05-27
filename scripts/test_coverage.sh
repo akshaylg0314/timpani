@@ -82,6 +82,7 @@ done
 set +e
 cargo tarpaulin --workspace $EXCLUDE_FLAGS --out Html --out Lcov --out Xml \
   --output-dir "$COVERAGE_ROOT/workspace" \
+  --config tarpaulin.toml \
   --engine llvm --timeout 120 --skip-clean \
   --ignore-panics --no-fail-fast \
   2>&1 | tee -a "$LOG_FILE" "$TARPAULIN_RAW_LOG"
