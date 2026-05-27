@@ -73,13 +73,14 @@ for pkg in $ALL_PKGS; do
 done
 
 # Stream tarpaulin output live (visible in CI logs) while also saving to file.
+# --workspace   : required for --exclude to work (selects all members, then excludes).
 # --engine llvm : compile-time instrumentation; avoids ptrace which hangs with tokio async tests.
 # --timeout 120 : kill any single test that exceeds 120 s — prevents infinite hangs.
 # --skip-clean  : reuse existing build artifacts for faster reruns.
-# Word-splitting of $TARPAULIN_PACKAGES and $EXCLUDE_FLAGS is intentional.
+# Word-splitting of $EXCLUDE_FLAGS is intentional (space-separated flag list).
 # shellcheck disable=SC2086
 set +e
-cargo tarpaulin --packages $TARPAULIN_PACKAGES $EXCLUDE_FLAGS --out Html --out Lcov --out Xml \
+cargo tarpaulin --workspace $EXCLUDE_FLAGS --out Html --out Lcov --out Xml \
   --output-dir "$COVERAGE_ROOT/workspace" \
   --engine llvm --timeout 120 --skip-clean \
   --ignore-panics --no-fail-fast \
