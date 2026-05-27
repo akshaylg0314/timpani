@@ -60,14 +60,26 @@ mkdir -p "$COVERAGE_ROOT/workspace"
 
 TARPAULIN_RAW_LOG="$COVERAGE_ROOT/workspace/tarpaulin_raw.log"
 
+# Build --exclude flags for every workspace package NOT in TARPAULIN_PACKAGES.
+# This ensures the HTML/Lcov/Xml report only contains the requested package(s).
+EXCLUDE_FLAGS=""
+ALL_PKGS=$(cargo metadata --manifest-path Cargo.toml --no-deps --format-version 1 2>/dev/null \
+  | jq -r '.packages[].name')
+for pkg in $ALL_PKGS; do
+  if ! echo " $TARPAULIN_PACKAGES " | grep -qw "$pkg"; then
+    EXCLUDE_FLAGS="$EXCLUDE_FLAGS --exclude $pkg"
+    echo "  ↳ excluding $pkg from coverage report" | tee -a "$LOG_FILE"
+  fi
+done
+
 # Stream tarpaulin output live (visible in CI logs) while also saving to file.
 # --engine llvm : compile-time instrumentation; avoids ptrace which hangs with tokio async tests.
 # --timeout 120 : kill any single test that exceeds 120 s — prevents infinite hangs.
 # --skip-clean  : reuse existing build artifacts for faster reruns.
-# Word-splitting of $TARPAULIN_PACKAGES is intentional (space-separated package list).
+# Word-splitting of $TARPAULIN_PACKAGES and $EXCLUDE_FLAGS is intentional.
 # shellcheck disable=SC2086
 set +e
-cargo tarpaulin --packages $TARPAULIN_PACKAGES --out Html --out Lcov --out Xml \
+cargo tarpaulin --packages $TARPAULIN_PACKAGES $EXCLUDE_FLAGS --out Html --out Lcov --out Xml \
   --output-dir "$COVERAGE_ROOT/workspace" \
   --engine llvm --timeout 120 --skip-clean \
   --ignore-panics --no-fail-fast \

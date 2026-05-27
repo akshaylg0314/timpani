@@ -153,7 +153,10 @@ jobs:
   coverage-summary:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    needs: coverage          # wait for both matrix jobs to finish
+    needs: coverage
+    # Run even if one or both coverage jobs failed (e.g. below threshold).
+    # This ensures the combined report is always generated for visibility.
+    if: always() && !contains(needs.coverage.result, 'cancelled')
 
     steps:
       - name: Download timpani-n coverage artifact
@@ -173,28 +176,41 @@ jobs:
 
       - name: Merge lcov reports
         run: |
-          lcov \
-            --add-tracefile coverage/timpani-n/workspace/lcov.info \
-            --add-tracefile coverage/timpani-o/workspace/lcov.info \
-            --output-file coverage/combined.info
+          # Collect whichever lcov files were actually produced (one or both may
+          # be missing if a package job failed before writing the report).
+          INPUTS=()
+          for f in \
+            coverage/timpani-n/workspace/lcov.info \
+            coverage/timpani-o/workspace/lcov.info; do
+            [[ -f "$f" ]] && INPUTS+=(--add-tracefile "$f") \
+              || echo "⚠️  $f not found — skipping"
+          done
+          if [[ ${#INPUTS[@]} -eq 0 ]]; then
+            echo "::error ::No lcov files found — cannot produce combined report"
+            exit 1
+          fi
+          lcov "${INPUTS[@]}" --output-file coverage/combined.info
 
       - name: Generate combined HTML report
         run: genhtml coverage/combined.info --output-directory coverage/combined-html
 
       - name: Print coverage summary to Actions UI
         run: |
-          # ── Individual summaries ──────────────────────────────────────────
-          N_RAW=$(lcov --summary coverage/timpani-n/workspace/lcov.info 2>&1)
-          N_LINES=$(echo "$N_RAW"  | grep -oP 'lines\.*:\s*\K[\d.]+%'     || echo "n/a")
-          N_FUNCS=$(echo "$N_RAW"  | grep -oP 'functions\.*:\s*\K[\d.]+%' || echo "n/a")
+          lcov_pct() {
+            local file="$1" metric="$2"
+            if [[ -f "$file" ]]; then
+              lcov --summary "$file" 2>&1 | grep -oP "${metric}\.*:\s*\K[\d.]+%" || echo "n/a"
+            else
+              echo "missing"
+            fi
+          }
 
-          O_RAW=$(lcov --summary coverage/timpani-o/workspace/lcov.info 2>&1)
-          O_LINES=$(echo "$O_RAW"  | grep -oP 'lines\.*:\s*\K[\d.]+%'     || echo "n/a")
-          O_FUNCS=$(echo "$O_RAW"  | grep -oP 'functions\.*:\s*\K[\d.]+%' || echo "n/a")
-
-          C_RAW=$(lcov --summary coverage/combined.info 2>&1)
-          C_LINES=$(echo "$C_RAW"  | grep -oP 'lines\.*:\s*\K[\d.]+%'     || echo "n/a")
-          C_FUNCS=$(echo "$C_RAW"  | grep -oP 'functions\.*:\s*\K[\d.]+%' || echo "n/a")
+          N_LINES=$(lcov_pct coverage/timpani-n/workspace/lcov.info "lines")
+          N_FUNCS=$(lcov_pct coverage/timpani-n/workspace/lcov.info "functions")
+          O_LINES=$(lcov_pct coverage/timpani-o/workspace/lcov.info "lines")
+          O_FUNCS=$(lcov_pct coverage/timpani-o/workspace/lcov.info "functions")
+          C_LINES=$(lcov_pct coverage/combined.info "lines")
+          C_FUNCS=$(lcov_pct coverage/combined.info "functions")
 
           # ── Write to GitHub Actions Step Summary ─────────────────────────
           {
