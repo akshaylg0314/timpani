@@ -2,7 +2,7 @@ name: Rust CI Reusable Workflow
 
 on:
   workflow_call:
-  workflow_dispatch: 
+  workflow_dispatch:
 
 permissions:
   packages: write
@@ -12,9 +12,10 @@ env:
   IMAGE_NAME: ${{ github.repository }}-rust
 
 jobs:
+  # ── Job 1: Build, test, lint ──────────────────────────────────────────────
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
 
     steps:
       - name: Checkout repository
@@ -24,6 +25,19 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+
+      - name: Cache cargo registry + build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-build-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-build-
+            ${{ runner.os }}-cargo-
 
       - name: Make scripts executable
         run: chmod +x scripts/*.sh
@@ -36,7 +50,6 @@ jobs:
           mkdir -p dist/reports/fmt
           mkdir -p dist/reports/deny
           mkdir -p dist/tests
-          mkdir -p dist/coverage/workspace
           mkdir -p dist/reports/clippy
 
       - name: Build and parse project
@@ -53,9 +66,6 @@ jobs:
 
       - name: Run cargo-deny checks
         run: ./scripts/deny_check.sh
-
-      - name: Run test coverage script
-        run: ./scripts/test_coverage.sh
 
       - name: Upload deny report
         if: always()
@@ -85,12 +95,59 @@ jobs:
           name: test-report
           path: dist/tests/*
 
-      - name: Upload coverage reports
+  # ── Job 2: Coverage — runs timpani-n and timpani-o in parallel ────────────
+  coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false          # let both packages report even if one fails
+      matrix:
+        package: [timpani-n, timpani-o]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # Cache key is per-package so the two matrix jobs don't overwrite each
+      # other's target/ directory.  ~/.cargo/bin caches the tarpaulin binary.
+      - name: Cache cargo + tarpaulin binary
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-coverage-${{ matrix.package }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-coverage-${{ matrix.package }}-
+            ${{ runner.os }}-cargo-
+
+      - name: Make scripts executable
+        run: chmod +x scripts/*.sh
+
+      - name: Install project dependencies
+        run: ./scripts/installdeps.sh
+
+      - name: Create coverage output folder
+        run: mkdir -p dist/coverage/workspace
+
+      # TARPAULIN_PACKAGES is read by test_coverage.sh to select which package
+      # to instrument.  The script handles install, engine, timeout, and threshold.
+      - name: Run coverage for ${{ matrix.package }}
+        env:
+          TARPAULIN_PACKAGES: ${{ matrix.package }}
+        run: ./scripts/test_coverage.sh
+
+      - name: Upload coverage report (${{ matrix.package }})
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: coverage-report
-          path: dist/coverage/*
+          name: coverage-${{ matrix.package }}
+          path: dist/coverage/
 
       # - name: Set up QEMU
       #   uses: docker/setup-qemu-action@v3

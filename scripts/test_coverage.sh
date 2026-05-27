@@ -49,6 +49,12 @@ export RUSTC_BOOTSTRAP=1
 
 COVERAGE_THRESHOLD=80
 
+# Which packages to instrument.
+# Override via TARPAULIN_PACKAGES env var for CI matrix builds, e.g.:
+#   TARPAULIN_PACKAGES=timpani-n ./scripts/test_coverage.sh
+# Defaults to running both packages together when called locally.
+TARPAULIN_PACKAGES="${TARPAULIN_PACKAGES:-timpani-n timpani-o}"
+
 echo "📂 Running tarpaulin for workspace" | tee -a "$LOG_FILE"
 mkdir -p "$COVERAGE_ROOT/workspace"
 
@@ -58,8 +64,10 @@ TARPAULIN_RAW_LOG="$COVERAGE_ROOT/workspace/tarpaulin_raw.log"
 # --engine llvm : compile-time instrumentation; avoids ptrace which hangs with tokio async tests.
 # --timeout 120 : kill any single test that exceeds 120 s — prevents infinite hangs.
 # --skip-clean  : reuse existing build artifacts for faster reruns.
+# Word-splitting of $TARPAULIN_PACKAGES is intentional (space-separated package list).
+# shellcheck disable=SC2086
 set +e
-cargo tarpaulin --packages timpani-n timpani-o --out Html --out Lcov --out Xml \
+cargo tarpaulin --packages $TARPAULIN_PACKAGES --out Html --out Lcov --out Xml \
   --output-dir "$COVERAGE_ROOT/workspace" \
   --engine llvm --timeout 120 --skip-clean \
   --ignore-panics --no-fail-fast \
