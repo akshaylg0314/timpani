@@ -199,6 +199,8 @@ jobs:
 
       - name: Print coverage summary to Actions UI
         run: |
+          COVERAGE_THRESHOLD=80
+
           lcov_pct() {
             local file="$1" metric="$2"
             if [[ -f "$file" ]]; then
@@ -215,6 +217,9 @@ jobs:
           C_LINES=$(lcov_pct coverage/combined.info "lines")
           C_FUNCS=$(lcov_pct coverage/combined.info "functions")
 
+          # Strip trailing % for numeric comparison
+          C_PCT=$(echo "$C_LINES" | tr -d '%')
+
           # ── Write to GitHub Actions Step Summary ─────────────────────────
           {
             echo "## 📊 Coverage Report"
@@ -224,6 +229,8 @@ jobs:
             echo "| timpani-n       | $N_LINES | $N_FUNCS |"
             echo "| timpani-o       | $O_LINES | $O_FUNCS |"
             echo "| **Combined**    | **$C_LINES** | **$C_FUNCS** |"
+            echo ""
+            echo "> Threshold: **${COVERAGE_THRESHOLD}%**"
           } >> "$GITHUB_STEP_SUMMARY"
 
           # ── Also print to the log ─────────────────────────────────────────
@@ -236,7 +243,22 @@ jobs:
           printf "│ %-11s │ %8s │ %9s │\n" "Combined" "$C_LINES" "$C_FUNCS"
           echo "└─────────────┴──────────┴───────────┘"
 
+          # ── Threshold check ───────────────────────────────────────────────
+          if [[ "$C_PCT" == "n/a" || "$C_PCT" == "missing" ]]; then
+            echo "::error ::Could not determine combined coverage — failing"
+            exit 1
+          fi
+          PASS=$(awk -v cov="$C_PCT" -v thr="$COVERAGE_THRESHOLD" \
+            'BEGIN { print (cov >= thr) ? "yes" : "no" }')
+          if [[ "$PASS" == "yes" ]]; then
+            echo "✅ Combined coverage ${C_LINES} >= ${COVERAGE_THRESHOLD}% — passed"
+          else
+            echo "::error ::Combined coverage ${C_LINES} is below the required ${COVERAGE_THRESHOLD}% threshold"
+            exit 1
+          fi
+
       - name: Upload combined coverage report
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: coverage-combined
