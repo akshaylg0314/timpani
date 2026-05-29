@@ -87,8 +87,10 @@ pub struct TimeTrigger {
     pub pid: Pid,
 
     /// A pidfd for `pid`.  Used for race-free signal delivery via
-    /// `pidfd_send_signal(2)`.  Closed automatically on drop.
-    pub pidfd: OwnedFd,
+    /// `pidfd_send_signal(2)`.  Wrapped in [`Arc`] so the timer task and the
+    /// future process-death monitoring task can each hold a reference without
+    /// duplicating the fd.  The fd is closed when the last `Arc` is dropped.
+    pub pidfd: Arc<OwnedFd>,
 
     /// Atomic state shared with the BPF ring-buffer callback.
     pub bpf_state: Arc<BpfState>,
@@ -182,7 +184,7 @@ pub fn init_task_list(sched_info: &SchedInfo) -> TimpaniResult<Vec<TimeTrigger>>
         tt_list.push(TimeTrigger {
             info: task_info.clone(),
             pid,
-            pidfd,
+            pidfd: Arc::new(pidfd),
             bpf_state: Arc::new(BpfState::default()),
             prev_timer: None,
             sigwait_ts_prev: 0,

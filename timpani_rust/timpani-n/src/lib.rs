@@ -77,12 +77,6 @@ pub fn initialize(ctx: &mut Context) -> TimpaniResult<()> {
     ctx.initialize()
 }
 
-/// Run the main loop
-pub fn run(_ctx: &mut Context) -> TimpaniResult<()> {
-    info!("Runtime loop not yet implemented");
-    Ok(())
-}
-
 /// Per-node startup and runtime loop.
 ///
 /// Sequence:
@@ -91,7 +85,8 @@ pub fn run(_ctx: &mut Context) -> TimpaniResult<()> {
 ///   3. Connect to Timpani-O (with retry)
 ///   4. GetSchedInfo       → populate ctx.runtime.sched_info
 ///   5. SyncTimer          → populate ctx.runtime.sync_start   (if enable_sync)
-///   6. RT wait loop       → waits for SIGINT/SIGTERM; timer loop fills this later
+///   6. Populate runtime state + start RT loop (per-task timers + hyperperiod cycle task)
+///   7. Workload watch loop → re-fetches schedule, stops/restarts RT loop on change
 pub async fn run_app(config: Config) -> TimpaniResult<()> {
     config.log_config();
 
@@ -196,10 +191,20 @@ pub async fn run_app(config: Config) -> TimpaniResult<()> {
     };
 
     // 6. Populate runtime state with schedule, task list, and sync information.
+    //    tt_list is consumed by the RT loop immediately below; ctx.runtime.tt_list
+    //    stays empty while the RT loop owns the TimeTriggers.
     ctx.runtime.sched_info = Some(sched_info);
-    ctx.runtime.tt_list = tt_list;
     ctx.runtime.sync_start = sync_start;
     ctx.comm.node_client = Some(client);
+
+    // 6b. Start RT loop — spawn per-task timer tasks + hyperperiod cycle task.
+    //     Mirrors start_timers() in core.c.
+    let start_at = core::compute_start_at(ctx.runtime.sync_start.as_ref());
+    let hp_manager = {
+        let si = ctx.runtime.sched_info.as_ref().unwrap();
+        context::HyperperiodManager::init(&si.workload_id, si.hyperperiod_us, si.tasks.len())
+    };
+    let mut rt_handle = core::start_rt_loop(tt_list, start_at, &cancel, hp_manager);
 
     // 7. Workload polling loop.
     //    Periodically re-fetches the schedule from Timpani-O to detect workload
@@ -207,8 +212,8 @@ pub async fn run_app(config: Config) -> TimpaniResult<()> {
     //    different tasks).  Versioning is client-side only: NodeSchedResponse has
     //    no server-side version field, so we do a structural content comparison.
     //
-    //    On change: logs the event and updates ctx.runtime.sched_info.
-    //    Full teardown + reinit of the RT loop is a TODO pending the task module.
+    //    On change: stops the current RT loop, tears down task list, reinitializes
+    //    with the new schedule, and starts a fresh RT loop.
     //
     //    NotReady (Timpani-O temporarily has no active workload) → keep running.
     let node_id = ctx.config.node_id.clone();
@@ -220,7 +225,7 @@ pub async fn run_app(config: Config) -> TimpaniResult<()> {
     poll_interval.tick().await;
     info!(
         interval_secs = WORKLOAD_POLL_INTERVAL_SECS,
-        "Startup complete — entering workload watch loop (RT loop pending task module)"
+        "Startup complete — RT loop running, entering workload watch loop"
     );
     loop {
         tokio::select! {
@@ -251,13 +256,32 @@ pub async fn run_app(config: Config) -> TimpaniResult<()> {
                         };
                         match ctx.runtime.sched_info.as_ref() {
                             None => {
-                                // Schedule was cleared (e.g. by cleanup or future
-                                // reconnect logic) — restore it from the latest poll.
-                                debug!(
+                                // sched_info was cleared (e.g. by cleanup or future
+                                // reconnect logic).  Restart RT loop with the new schedule.
+                                info!(
                                     workload_id = %new_sched.workload_id,
-                                    "sched_info was absent; restoring from latest poll"
+                                    "sched_info was absent; starting fresh RT loop"
                                 );
-                                ctx.runtime.sched_info = Some(new_sched);
+                                rt_handle.stop().await;
+                                let old_tt = std::mem::take(&mut ctx.runtime.tt_list);
+                                task::teardown_task_list(old_tt);
+                                match task::init_task_list(&new_sched) {
+                                    Ok(new_tt) => {
+                                        let new_start_at = core::compute_start_at(None);
+                                        let new_hp = context::HyperperiodManager::init(
+                                            &new_sched.workload_id,
+                                            new_sched.hyperperiod_us,
+                                            new_sched.tasks.len(),
+                                        );
+                                        rt_handle =
+                                            core::start_rt_loop(new_tt, new_start_at, &cancel, new_hp);
+                                        ctx.runtime.sched_info = Some(new_sched);
+                                    }
+                                    Err(e) => {
+                                        warn!(error = ?e, "Failed to init task list — shutting down");
+                                        return Err(e);
+                                    }
+                                }
                             }
                             Some(current) => {
                                 if current.content_changed(&new_sched) {
@@ -275,14 +299,23 @@ pub async fn run_app(config: Config) -> TimpaniResult<()> {
                                             "Workload updated — teardown and reinit"
                                         );
                                     }
-                                    // Teardown current task list and reinitialize with
-                                    // the new schedule.  If reinit fails, abort: the
-                                    // process has no valid task list to continue with.
+                                    // Stop the RT loop, teardown current task list, and
+                                    // reinitialize with the new schedule.  If reinit
+                                    // fails, abort: no valid task list to continue with.
+                                    rt_handle.stop().await;
                                     let old_tt = std::mem::take(&mut ctx.runtime.tt_list);
                                     task::teardown_task_list(old_tt);
                                     match task::init_task_list(&new_sched) {
                                         Ok(new_tt) => {
-                                            ctx.runtime.tt_list = new_tt;
+                                            let new_start_at = core::compute_start_at(None);
+                                            let new_hp = context::HyperperiodManager::init(
+                                                &new_sched.workload_id,
+                                                new_sched.hyperperiod_us,
+                                                new_sched.tasks.len(),
+                                            );
+                                            rt_handle = core::start_rt_loop(
+                                                new_tt, new_start_at, &cancel, new_hp,
+                                            );
                                             ctx.runtime.sched_info = Some(new_sched);
                                         }
                                         Err(e) => {
@@ -316,6 +349,8 @@ pub async fn run_app(config: Config) -> TimpaniResult<()> {
         }
     }
 
+    // Stop all timer tasks before releasing resources.
+    rt_handle.stop().await;
     ctx.cleanup();
     Ok(())
 }
@@ -332,13 +367,6 @@ mod tests {
     }
 
     #[test]
-    fn test_run_with_default_context() {
-        let config = Config::default();
-        let mut ctx = Context::new(config);
-        assert!(run(&mut ctx).is_ok());
-    }
-
-    #[test]
     fn test_initialize_multiple_times() {
         let config = Config::default();
         let mut ctx = Context::new(config);
@@ -346,17 +374,6 @@ mod tests {
         // Initialize should be idempotent
         assert!(initialize(&mut ctx).is_ok());
         assert!(initialize(&mut ctx).is_ok());
-    }
-
-    #[test]
-    fn test_context_lifecycle() {
-        let config = Config::default();
-        let mut ctx = Context::new(config);
-
-        // Full lifecycle
-        assert!(initialize(&mut ctx).is_ok());
-        assert!(run(&mut ctx).is_ok());
-        ctx.cleanup();
     }
 
     #[test]
@@ -440,7 +457,7 @@ mod tests {
                 Err(error::TimpaniError::Permission) => {} // Expected without privileges
                 Err(e) => panic!("Unexpected error for config {:?}: {:?}", config, e),
             }
-            assert!(run(&mut ctx).is_ok());
+            // run() removed; initialize + cleanup covers the lifecycle
             ctx.cleanup();
         }
     }
