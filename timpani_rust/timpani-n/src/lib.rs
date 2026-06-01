@@ -11,14 +11,39 @@ pub mod grpc;
 pub mod proto;
 pub mod sched;
 pub mod signal;
+pub mod task;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use crate::proto::schedinfo_v1::ScheduledTask;
 use config::Config;
-use context::{Context, SchedInfo, SyncStartTime};
+use context::{Context, SchedInfo, SyncStartTime, TaskInfo};
 use error::{TimpaniError, TimpaniResult};
-use tracing::{debug, error, info};
+use tokio::time::MissedTickBehavior;
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::{fmt::SubscriberBuilder, EnvFilter};
+
+/// How often to re-fetch GetSchedInfo and compare for workload changes.
+const WORKLOAD_POLL_INTERVAL_SECS: u64 = 2;
+
+/// Convert a single proto [`ScheduledTask`] into the domain [`TaskInfo`] type.
+///
+/// Proto uses `int32` for most numeric fields; `.max(0)` guards against
+/// negative wire values before the cast to `u32`.  `cpu_affinity` is already
+/// a `uint64` bitmask on the wire and is copied through directly.
+fn task_from_proto(t: &ScheduledTask) -> TaskInfo {
+    TaskInfo {
+        name: t.name.chars().take(16).collect(),
+        sched_policy: t.sched_policy.max(0) as u32,
+        sched_priority: t.sched_priority.max(0) as u32,
+        period_us: t.period_us.max(0) as u32,
+        release_time_us: t.release_time_us.max(0) as u32,
+        runtime_us: t.runtime_us.max(0) as u32,
+        deadline_us: t.deadline_us.max(0) as u32,
+        cpu_affinity: t.cpu_affinity,
+        max_dmiss: t.max_dmiss.max(0) as u32,
+    }
+}
 
 /// Initialize logging with the specified log level.
 ///
@@ -117,14 +142,14 @@ pub async fn run_app(config: Config) -> TimpaniResult<()> {
             }
         }
     };
-    let task_count = sched_resp.tasks.len();
+    let tasks: Vec<TaskInfo> = sched_resp.tasks.iter().map(task_from_proto).collect();
     info!(
         workload_id    = %sched_resp.workload_id,
         hyperperiod_us = sched_resp.hyperperiod_us,
-        task_count,
+        task_count     = tasks.len(),
         "Schedule received from Timpani-O"
     );
-    for (i, task) in sched_resp.tasks.iter().enumerate() {
+    for (i, task) in tasks.iter().enumerate() {
         debug!(
             index         = i,
             name          = %task.name,
@@ -142,8 +167,12 @@ pub async fn run_app(config: Config) -> TimpaniResult<()> {
     let sched_info = SchedInfo {
         workload_id: sched_resp.workload_id,
         hyperperiod_us: sched_resp.hyperperiod_us,
-        task_count,
+        tasks,
+        received_at: Instant::now(),
     };
+
+    // 4b. init_task_list — find each process, apply affinity + schedattr, open pidfds.
+    let tt_list = task::init_task_list(&sched_info)?;
 
     // 5. SyncTimer — barrier across all active nodes (skipped if enable_sync=false).
     let sync_start = if ctx.config.enable_sync {
@@ -166,16 +195,126 @@ pub async fn run_app(config: Config) -> TimpaniResult<()> {
         None
     };
 
-    // 6. Populate runtime state with schedule and sync information.
+    // 6. Populate runtime state with schedule, task list, and sync information.
     ctx.runtime.sched_info = Some(sched_info);
+    ctx.runtime.tt_list = tt_list;
     ctx.runtime.sync_start = sync_start;
     ctx.comm.node_client = Some(client);
 
-    // 7. RT wait loop.  The timer/task module will replace this with the
-    //    real deadline-driven loop; ReportDMiss will be called from there.
-    info!("Startup complete — waiting for shutdown signal (RT loop not yet implemented)");
-    cancel.cancelled().await;
-    info!("Shutdown signal received — cleaning up");
+    // 7. Workload polling loop.
+    //    Periodically re-fetches the schedule from Timpani-O to detect workload
+    //    changes (new workload_id) or task-parameter updates (same workload_id,
+    //    different tasks).  Versioning is client-side only: NodeSchedResponse has
+    //    no server-side version field, so we do a structural content comparison.
+    //
+    //    On change: logs the event and updates ctx.runtime.sched_info.
+    //    Full teardown + reinit of the RT loop is a TODO pending the task module.
+    //
+    //    NotReady (Timpani-O temporarily has no active workload) → keep running.
+    let node_id = ctx.config.node_id.clone();
+    let mut poll_interval = tokio::time::interval(Duration::from_secs(WORKLOAD_POLL_INTERVAL_SECS));
+    // Skip ticks that were missed while handling a long workload update.
+    poll_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    // Consume the first immediate tick so the first real poll fires after
+    // WORKLOAD_POLL_INTERVAL_SECS, not at t=0 right after startup.
+    poll_interval.tick().await;
+    info!(
+        interval_secs = WORKLOAD_POLL_INTERVAL_SECS,
+        "Startup complete — entering workload watch loop (RT loop pending task module)"
+    );
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                info!("Shutdown signal received — cleaning up");
+                break;
+            }
+            _ = poll_interval.tick() => {
+                // Borrow ctx.comm in its own block so the &mut NodeClient is
+                // released before we borrow ctx.runtime below.
+                let poll_result = {
+                    let Some(client) = ctx.comm.node_client.as_mut() else {
+                        warn!("Workload poll skipped: NodeClient is not available");
+                        continue;
+                    };
+                    client.get_sched_info(&node_id).await
+                };
+                match poll_result {
+                    Ok(new_resp) => {
+                        let new_tasks: Vec<TaskInfo> =
+                            new_resp.tasks.iter().map(task_from_proto).collect();
+                        let new_sched = SchedInfo {
+                            workload_id:   new_resp.workload_id,
+                            hyperperiod_us: new_resp.hyperperiod_us,
+                            tasks:         new_tasks,
+                            received_at:   Instant::now(),
+                        };
+                        match ctx.runtime.sched_info.as_ref() {
+                            None => {
+                                // Schedule was cleared (e.g. by cleanup or future
+                                // reconnect logic) — restore it from the latest poll.
+                                debug!(
+                                    workload_id = %new_sched.workload_id,
+                                    "sched_info was absent; restoring from latest poll"
+                                );
+                                ctx.runtime.sched_info = Some(new_sched);
+                            }
+                            Some(current) => {
+                                if current.content_changed(&new_sched) {
+                                    if current.is_full_replacement(&new_sched) {
+                                        info!(
+                                            old_workload = %current.workload_id,
+                                            new_workload = %new_sched.workload_id,
+                                            "Workload replaced — full teardown and reinit"
+                                        );
+                                    } else {
+                                        info!(
+                                            workload_id    = %new_sched.workload_id,
+                                            old_task_count = current.tasks.len(),
+                                            new_task_count = new_sched.tasks.len(),
+                                            "Workload updated — teardown and reinit"
+                                        );
+                                    }
+                                    // Teardown current task list and reinitialize with
+                                    // the new schedule.  If reinit fails, abort: the
+                                    // process has no valid task list to continue with.
+                                    let old_tt = std::mem::take(&mut ctx.runtime.tt_list);
+                                    task::teardown_task_list(old_tt);
+                                    match task::init_task_list(&new_sched) {
+                                        Ok(new_tt) => {
+                                            ctx.runtime.tt_list = new_tt;
+                                            ctx.runtime.sched_info = Some(new_sched);
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                error = ?e,
+                                                "Failed to reinitialize task list after workload \
+                                                 change — shutting down"
+                                            );
+                                            return Err(e);
+                                        }
+                                    }
+                                } else {
+                                    // Content unchanged — advance received_at so callers can
+                                    // detect when the last successful fetch occurred.
+                                    ctx.runtime.sched_info.as_mut().unwrap().received_at =
+                                        new_sched.received_at;
+                                }
+                            }
+                        }
+                    }
+                    Err(TimpaniError::NotReady) => {
+                        // Timpani-O is alive but has no active workload right now
+                        // (e.g. between submissions).  Keep current schedule running.
+                        debug!("Workload poll: no active workload on Timpani-O — keeping current");
+                    }
+                    Err(e) => {
+                        warn!(error = ?e, "Workload poll failed — retrying next interval");
+                    }
+                }
+            }
+        }
+    }
 
     ctx.cleanup();
     Ok(())
@@ -332,8 +471,7 @@ mod run_app_tests {
     use super::*;
     use crate::proto::schedinfo_v1::{
         node_service_server::{NodeService, NodeServiceServer},
-        NodeResponse, NodeSchedRequest, NodeSchedResponse, ScheduledTask, SyncRequest,
-        SyncResponse,
+        NodeResponse, NodeSchedRequest, NodeSchedResponse, SyncRequest, SyncResponse,
     };
     use std::net::SocketAddr;
     use tonic::{transport::Server, Request, Response, Status};
@@ -354,21 +492,14 @@ mod run_app_tests {
                 return Err(Status::not_found("No workload scheduled yet"));
             }
 
+            // Empty task list — init_task_list must succeed trivially so
+            // these tests can reach the SyncTimer/polling-loop behaviour they
+            // are actually testing.  Real task resolution against /proc is
+            // exercised by task::tests::init_task_list_*.
             let response = NodeSchedResponse {
                 workload_id: "test-workload-001".to_string(),
                 hyperperiod_us: 1_000_000,
-                tasks: vec![ScheduledTask {
-                    name: "test_task".to_string(),
-                    sched_policy: 1,
-                    sched_priority: 50,
-                    period_us: 100_000,
-                    deadline_us: 100_000,
-                    runtime_us: 10_000,
-                    release_time_us: 0,
-                    cpu_affinity: 1,
-                    max_dmiss: 5,
-                    assigned_node: "test-node".to_string(),
-                }],
+                tasks: vec![],
             };
 
             Ok(Response::new(response))
@@ -529,5 +660,234 @@ mod run_app_tests {
         let result = run_app(config).await;
         // Should fail to connect
         assert!(result.is_err());
+    }
+}
+
+// ── Polling-loop tests with a stateful mock ───────────────────────────────────
+
+#[cfg(test)]
+mod run_app_polling_tests {
+    use super::*;
+    use crate::error::TimpaniError;
+    use crate::proto::schedinfo_v1::{
+        node_service_server::{NodeService, NodeServiceServer},
+        NodeResponse, NodeSchedRequest, NodeSchedResponse, ScheduledTask, SyncRequest,
+        SyncResponse,
+    };
+    use std::net::SocketAddr;
+    use std::sync::{Arc, Mutex};
+    use tonic::{transport::Server, Request, Response, Status};
+
+    /// Controls which response the mock returns on its second and subsequent calls.
+    enum Scenario {
+        /// workload_id changes v1 → v2, both with empty task lists.
+        WorkloadReplaced,
+        /// Same workload_id, hyperperiod doubles — sched_info must be refreshed.
+        ParamsUpdated,
+        /// Server returns NOT_FOUND for every poll after the initial fetch.
+        NotReadyAfterFirst,
+        /// Server returns a task whose process does not exist on the second call.
+        UnknownTaskAfterFirst,
+    }
+
+    struct StatefulMockService {
+        call_count: Arc<Mutex<u32>>,
+        scenario: Scenario,
+    }
+
+    #[tonic::async_trait]
+    impl NodeService for StatefulMockService {
+        async fn get_sched_info(
+            &self,
+            _request: Request<NodeSchedRequest>,
+        ) -> Result<Response<NodeSchedResponse>, Status> {
+            let count = {
+                let mut c = self.call_count.lock().unwrap();
+                *c += 1;
+                *c
+            };
+            match &self.scenario {
+                Scenario::WorkloadReplaced => {
+                    if count == 1 {
+                        Ok(Response::new(NodeSchedResponse {
+                            workload_id: "workload-v1".to_string(),
+                            hyperperiod_us: 1_000_000,
+                            tasks: vec![],
+                        }))
+                    } else {
+                        Ok(Response::new(NodeSchedResponse {
+                            workload_id: "workload-v2".to_string(),
+                            hyperperiod_us: 1_000_000,
+                            tasks: vec![],
+                        }))
+                    }
+                }
+                Scenario::ParamsUpdated => {
+                    if count == 1 {
+                        Ok(Response::new(NodeSchedResponse {
+                            workload_id: "workload-stable".to_string(),
+                            hyperperiod_us: 1_000_000,
+                            tasks: vec![],
+                        }))
+                    } else {
+                        Ok(Response::new(NodeSchedResponse {
+                            workload_id: "workload-stable".to_string(),
+                            hyperperiod_us: 2_000_000,
+                            tasks: vec![],
+                        }))
+                    }
+                }
+                Scenario::NotReadyAfterFirst => {
+                    if count == 1 {
+                        Ok(Response::new(NodeSchedResponse {
+                            workload_id: "workload-gone".to_string(),
+                            hyperperiod_us: 1_000_000,
+                            tasks: vec![],
+                        }))
+                    } else {
+                        Err(Status::not_found("workload removed"))
+                    }
+                }
+                Scenario::UnknownTaskAfterFirst => {
+                    if count == 1 {
+                        Ok(Response::new(NodeSchedResponse {
+                            workload_id: "workload-v1".to_string(),
+                            hyperperiod_us: 1_000_000,
+                            tasks: vec![],
+                        }))
+                    } else {
+                        Ok(Response::new(NodeSchedResponse {
+                            workload_id: "workload-v2".to_string(),
+                            hyperperiod_us: 1_000_000,
+                            tasks: vec![ScheduledTask {
+                                name: "__no_such_proc__".to_string(),
+                                sched_policy: 0,
+                                sched_priority: 0,
+                                period_us: 10_000,
+                                release_time_us: 0,
+                                runtime_us: 1_000,
+                                deadline_us: 10_000,
+                                cpu_affinity: 0,
+                                max_dmiss: 0,
+                                assigned_node: String::new(),
+                            }],
+                        }))
+                    }
+                }
+            }
+        }
+
+        async fn sync_timer(
+            &self,
+            _: Request<SyncRequest>,
+        ) -> Result<Response<SyncResponse>, Status> {
+            Ok(Response::new(SyncResponse {
+                ack: true,
+                start_time_sec: 1_234_567_890,
+                start_time_nsec: 0,
+            }))
+        }
+
+        async fn report_d_miss(
+            &self,
+            _: Request<crate::proto::schedinfo_v1::DeadlineMissInfo>,
+        ) -> Result<Response<NodeResponse>, Status> {
+            Ok(Response::new(NodeResponse {
+                status: 0,
+                error_message: String::new(),
+            }))
+        }
+    }
+
+    async fn start_stateful_server(
+        port: u16,
+        scenario: Scenario,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let addr = format!("127.0.0.1:{port}").parse::<SocketAddr>()?;
+        let service = StatefulMockService {
+            call_count: Arc::new(Mutex::new(0)),
+            scenario,
+        };
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(NodeServiceServer::new(service))
+                .serve(addr)
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        Ok(())
+    }
+
+    fn polling_config(port: u16) -> Config {
+        Config {
+            addr: "127.0.0.1".to_string(),
+            port,
+            node_id: "test-node".to_string(),
+            enable_sync: false,
+            max_retries: 3,
+            ..Default::default()
+        }
+    }
+
+    // D1: workload_id changes — run_app reinitialises with empty task list and keeps running.
+    #[tokio::test]
+    async fn test_run_app_workload_id_replaced() {
+        start_stateful_server(50300, Scenario::WorkloadReplaced)
+            .await
+            .unwrap();
+        let handle = tokio::spawn(run_app(polling_config(50300)));
+        // Wait long enough for the first poll cycle (~2 s) to complete.
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert!(
+            !handle.is_finished(),
+            "run_app must keep running after a workload replacement with an empty task list"
+        );
+        handle.abort();
+    }
+
+    // D2: same workload_id, hyperperiod updated — sched_info refreshed, loop continues.
+    #[tokio::test]
+    async fn test_run_app_workload_params_updated() {
+        start_stateful_server(50301, Scenario::ParamsUpdated)
+            .await
+            .unwrap();
+        let handle = tokio::spawn(run_app(polling_config(50301)));
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert!(
+            !handle.is_finished(),
+            "run_app must keep running after an in-place hyperperiod update"
+        );
+        handle.abort();
+    }
+
+    // D3: workload disappears after startup — run_app keeps old schedule and stays alive.
+    #[tokio::test]
+    async fn test_run_app_polling_notready_keeps_running() {
+        start_stateful_server(50302, Scenario::NotReadyAfterFirst)
+            .await
+            .unwrap();
+        let handle = tokio::spawn(run_app(polling_config(50302)));
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert!(
+            !handle.is_finished(),
+            "NOT_FOUND during poll must not terminate run_app"
+        );
+        handle.abort();
+    }
+
+    // D4: poll returns a task whose process does not exist — init_task_list fails, run_app exits.
+    #[tokio::test]
+    async fn test_run_app_init_task_list_fails_on_update() {
+        start_stateful_server(50303, Scenario::UnknownTaskAfterFirst)
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), run_app(polling_config(50303)))
+            .await
+            .expect("run_app must exit within 5 s when init_task_list fails on a workload update");
+        assert!(
+            matches!(result, Err(TimpaniError::Io)),
+            "init_task_list failure during a workload update must propagate as TimpaniError::Io, \
+             got {result:?}"
+        );
     }
 }
