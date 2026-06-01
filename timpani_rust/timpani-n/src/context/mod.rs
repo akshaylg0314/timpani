@@ -128,15 +128,100 @@ pub struct CommState {
     // - apex_fd (Apex.OS Monitor Socket FD)
 }
 
-/// Hyperperiod manager structure
-/// Maps to context.hp_manager from C implementation
+/// Hyperperiod statistics and cycle tracking.
+///
+/// Mirrors `struct hyperperiod_manager` from `internal.h`.  Initialized by
+/// [`HyperperiodManager::init`] just before timers start, then updated once
+/// per hyperperiod cycle by the RT loop's cycle task.
+///
+/// Deadline-miss fields are incremented by the timer callback; the cycle task
+/// resets [`cycle_deadline_misses`] on each cycle boundary.
 #[derive(Debug, Default)]
 pub struct HyperperiodManager {
-    // TODO: Add fields as we port hyperperiod module:
-    // - hyperperiod_us
-    // - current_cycle
-    // - workload_id
-    // - etc.
+    /// Workload identifier this manager was initialized for.
+    pub workload_id: String,
+    /// Hyperperiod duration in microseconds.  0 = not yet initialized.
+    pub hyperperiod_us: u64,
+    /// Total hyperperiod cycles completed since timers started.
+    pub completed_cycles: u64,
+    /// Current cycle index (incremented each cycle, matches `completed_cycles`).
+    pub current_cycle: u64,
+    /// Total deadline misses across all tasks and all cycles.
+    pub total_deadline_misses: u32,
+    /// Deadline misses within the current (most recent) cycle.
+    /// Reset to 0 on each cycle boundary by [`on_cycle_complete`].
+    pub cycle_deadline_misses: u32,
+    /// Number of tasks registered for this hyperperiod.
+    pub tasks_in_hyperperiod: u32,
+}
+
+/// Log hyperperiod statistics every N completed cycles.
+const HP_STATS_LOG_INTERVAL: u64 = 100;
+
+impl HyperperiodManager {
+    /// Initialize from a schedule received from Timpani-O.
+    pub fn init(workload_id: &str, hyperperiod_us: u64, task_count: usize) -> Self {
+        info!(
+            workload_id,
+            hyperperiod_us,
+            task_count,
+            hyperperiod_ms = hyperperiod_us as f64 / 1_000.0,
+            "HyperperiodManager initialized"
+        );
+        Self {
+            workload_id: workload_id.to_string(),
+            hyperperiod_us,
+            completed_cycles: 0,
+            current_cycle: 0,
+            total_deadline_misses: 0,
+            cycle_deadline_misses: 0,
+            tasks_in_hyperperiod: task_count as u32,
+        }
+    }
+
+    /// Called once per hyperperiod cycle (by the RT loop's cycle task).
+    ///
+    /// Advances cycle counters, resets per-cycle miss count, and logs
+    /// statistics every [`HP_STATS_LOG_INTERVAL`] cycles.
+    pub fn on_cycle_complete(&mut self) {
+        self.completed_cycles += 1;
+        self.current_cycle = self.completed_cycles;
+        self.cycle_deadline_misses = 0;
+        if self.completed_cycles % HP_STATS_LOG_INTERVAL == 0 {
+            self.log_statistics();
+        }
+    }
+
+    /// Record one deadline miss for the current cycle.
+    ///
+    /// Called by the timer callback when BPF-based deadline-miss detection
+    /// is enabled.  For now this is a counter-only hook; the BPF module will
+    /// call this when it detects a task overrun.
+    pub fn record_deadline_miss(&mut self) {
+        self.total_deadline_misses += 1;
+        self.cycle_deadline_misses += 1;
+    }
+
+    /// Log hyperperiod statistics at INFO level.
+    ///
+    /// Mirrors `log_hyperperiod_statistics()` from `hyperperiod.c`.
+    pub fn log_statistics(&self) {
+        let miss_rate = if self.completed_cycles > 0 {
+            self.total_deadline_misses as f64 / self.completed_cycles as f64
+        } else {
+            0.0
+        };
+        info!(
+            workload    = %self.workload_id,
+            cycles      = self.completed_cycles,
+            hp_us       = self.hyperperiod_us,
+            total_miss  = self.total_deadline_misses,
+            cycle_miss  = self.cycle_deadline_misses,
+            miss_rate   = format_args!("{:.4}", miss_rate),
+            tasks       = self.tasks_in_hyperperiod,
+            "=== Hyperperiod statistics ==="
+        );
+    }
 }
 
 /// Main context structure for Timpani-N

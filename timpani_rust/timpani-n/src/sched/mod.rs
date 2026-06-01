@@ -328,6 +328,37 @@ pub fn send_signal_pidfd(
     Ok(())
 }
 
+/// Send the Timpani time-trigger signal (`SIGNO_TT`) to the process referenced
+/// by `pidfd`.
+///
+/// `SIGNO_TT = __SIGRTMIN + 2` (defined in `timetrigger.h`).  On Linux with
+/// NPTL, `__SIGRTMIN = 32` and the threading library occupies 32 and 33, so
+/// `SIGNO_TT = 34 = libc::SIGRTMIN()`.  Using `libc::SIGRTMIN()` at runtime
+/// is more portable than a compile-time constant across architectures.
+pub fn send_tt_signal_pidfd(pidfd: BorrowedFd<'_>) -> TimpaniResult<()> {
+    let signo = libc::SIGRTMIN();
+    // SAFETY: pidfd_send_signal(fd, sig, NULL, 0); info=NULL is well-defined.
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd.as_raw_fd() as libc::c_long,
+            signo as libc::c_long,
+            0i64, // siginfo_t* = NULL
+            0u32, // flags = 0
+        )
+    };
+    if ret < 0 {
+        let err = nix::errno::Errno::last();
+        tracing::error!("pidfd_send_signal(SIGNO_TT={}) failed: {}", signo, err);
+        return Err(match err {
+            nix::errno::Errno::EPERM | nix::errno::Errno::EACCES => TimpaniError::Permission,
+            nix::errno::Errno::ESRCH => TimpaniError::Signal, // task process is dead
+            _ => TimpaniError::Io,
+        });
+    }
+    Ok(())
+}
+
 /// Returns `true` if the process referenced by `pidfd` is still alive.
 /// Sends the null signal (0) — checks existence without delivering anything to the process.
 pub fn is_process_alive(pidfd: BorrowedFd<'_>) -> bool {
