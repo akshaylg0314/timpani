@@ -17,6 +17,12 @@
 //!
 //!
 
+pub mod bpf_events;
+pub mod bpf_manager;
+
+pub use bpf_events::{SchedstatEvent, SigwaitEvent};
+pub use bpf_manager::{BpfManager, SchedstatCallback, SigwaitCallback};
+
 use std::sync::atomic::{AtomicI64, Ordering};
 use tracing::{debug, info};
 

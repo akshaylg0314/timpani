@@ -171,6 +171,9 @@ pub async fn run_app(config: Config) -> TimpaniResult<()> {
     ctx.runtime.sync_start = sync_start;
     ctx.comm.node_client = Some(client);
 
+    // 6.5. Initialize BPF monitoring (after schedule is available, before task init)
+    ctx.init_bpf_monitoring()?;
+
     // 7. RT wait loop.  The timer/task module will replace this with the
     //    real deadline-driven loop; ReportDMiss will be called from there.
     info!("Startup complete — waiting for shutdown signal (RT loop not yet implemented)");
