@@ -59,7 +59,11 @@ mod tests {
         // Size is 24 bytes on x86_64 (4+4+8+1+3 padding for alignment)
         // The struct is repr(C) so padding matches C compiler behavior
         let size = std::mem::size_of::<SigwaitEvent>();
-        assert!(size == 21 || size == 24, "Expected 21 or 24 bytes, got {}", size);
+        assert!(
+            size == 21 || size == 24,
+            "Expected 21 or 24 bytes, got {}",
+            size
+        );
     }
 
     #[test]

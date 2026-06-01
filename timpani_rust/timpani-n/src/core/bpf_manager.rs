@@ -228,8 +228,7 @@ impl BpfManager {
             {
                 if let Some(ref state) = self.schedstat_state {
                     let map = &state._skel.maps.pid_filter_map;
-                    if let Err(e) = map.update(&key_bytes, &value_bytes, libbpf_rs::MapFlags::ANY)
-                    {
+                    if let Err(e) = map.update(&key_bytes, &value_bytes, libbpf_rs::MapFlags::ANY) {
                         warn!(
                             "Failed to add PID {} to schedstat pid_filter_map: {}",
                             pid, e
@@ -323,17 +322,19 @@ impl BpfManager {
         let rb_map = &skel.maps.buffer;
         let mut rb_builder = RingBufferBuilder::new();
 
-        rb_builder.add(rb_map, move |data: &[u8]| {
-            if let Some(event) = SigwaitEvent::from_bytes(data) {
-                callback(event);
-            } else {
-                error!("Failed to parse sigwait event from ring buffer");
-            }
-            0 // Return 0 for success
-        }).map_err(|e| {
-            error!("Failed to add sigwait ring buffer: {}", e);
-            TimpaniError::Bpf
-        })?;
+        rb_builder
+            .add(rb_map, move |data: &[u8]| {
+                if let Some(event) = SigwaitEvent::from_bytes(data) {
+                    callback(event);
+                } else {
+                    error!("Failed to parse sigwait event from ring buffer");
+                }
+                0 // Return 0 for success
+            })
+            .map_err(|e| {
+                error!("Failed to add sigwait ring buffer: {}", e);
+                TimpaniError::Bpf
+            })?;
 
         let rb = rb_builder.build().map_err(|e| {
             error!("Failed to build sigwait ring buffer: {}", e);
@@ -400,17 +401,19 @@ impl BpfManager {
         let rb_map = &skel.maps.buffer;
         let mut rb_builder = RingBufferBuilder::new();
 
-        rb_builder.add(rb_map, move |data: &[u8]| {
-            if let Some(event) = SchedstatEvent::from_bytes(data) {
-                callback(event);
-            } else {
-                error!("Failed to parse schedstat event from ring buffer");
-            }
-            0 // Return 0 for success
-        }).map_err(|e| {
-            error!("Failed to add schedstat ring buffer: {}", e);
-            TimpaniError::Bpf
-        })?;
+        rb_builder
+            .add(rb_map, move |data: &[u8]| {
+                if let Some(event) = SchedstatEvent::from_bytes(data) {
+                    callback(event);
+                } else {
+                    error!("Failed to parse schedstat event from ring buffer");
+                }
+                0 // Return 0 for success
+            })
+            .map_err(|e| {
+                error!("Failed to add schedstat ring buffer: {}", e);
+                TimpaniError::Bpf
+            })?;
 
         let rb = rb_builder.build().map_err(|e| {
             error!("Failed to build schedstat ring buffer: {}", e);
