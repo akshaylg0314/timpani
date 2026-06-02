@@ -21,4 +21,5 @@ exclude-files = [
     "timpani-n/src/main.rs",
     "timpani-o/src/main.rs",
     "timpani-n/tests/*",
+    "timpani-n/src/core/bpf_manager.rs" # BPF to be loaded successfully (needs root/CAP_BPF)
 ]
