@@ -552,4 +552,57 @@ mod tests {
         );
         assert_eq!(a.task_count(), 2);
     }
+
+    #[test]
+    fn test_hyperperiod_manager_record_deadline_miss() {
+        let mut hp = HyperperiodManager::init("test-wl", 100_000, 2);
+        assert_eq!(hp.total_deadline_misses, 0);
+        assert_eq!(hp.cycle_deadline_misses, 0);
+
+        hp.record_deadline_miss();
+        assert_eq!(hp.total_deadline_misses, 1);
+        assert_eq!(hp.cycle_deadline_misses, 1);
+
+        hp.record_deadline_miss();
+        assert_eq!(hp.total_deadline_misses, 2);
+        assert_eq!(hp.cycle_deadline_misses, 2);
+    }
+
+    #[test]
+    fn test_hyperperiod_manager_on_cycle_complete_resets_cycle_misses() {
+        let mut hp = HyperperiodManager::init("test-wl", 100_000, 2);
+
+        hp.record_deadline_miss();
+        hp.record_deadline_miss();
+        assert_eq!(hp.cycle_deadline_misses, 2);
+        assert_eq!(hp.completed_cycles, 0);
+
+        hp.on_cycle_complete();
+        assert_eq!(hp.cycle_deadline_misses, 0); // Reset
+        assert_eq!(hp.total_deadline_misses, 2); // Preserved
+        assert_eq!(hp.completed_cycles, 1);
+        assert_eq!(hp.current_cycle, 1);
+    }
+
+    #[test]
+    fn test_hyperperiod_manager_log_statistics_with_zero_cycles() {
+        let hp = HyperperiodManager::init("test-wl", 100_000, 2);
+        // Should not panic with zero completed_cycles
+        hp.log_statistics();
+    }
+
+    #[test]
+    fn test_hyperperiod_manager_log_statistics_with_data() {
+        let mut hp = HyperperiodManager::init("test-wl", 100_000, 2);
+        hp.record_deadline_miss();
+        hp.on_cycle_complete();
+        hp.record_deadline_miss();
+        hp.record_deadline_miss();
+        hp.on_cycle_complete();
+
+        // Should log with calculated miss rate
+        hp.log_statistics();
+        assert_eq!(hp.total_deadline_misses, 3);
+        assert_eq!(hp.completed_cycles, 2);
+    }
 }

@@ -71,4 +71,77 @@ mod tests {
         // Verify struct layout matches C (should be 32 bytes)
         assert_eq!(std::mem::size_of::<SchedstatEvent>(), 32);
     }
+
+    #[test]
+    fn test_sigwait_event_from_bytes_valid() {
+        // Create raw bytes representing a SigwaitEvent
+        let mut data = vec![0u8; 24];
+        // pid = 1234 (little endian)
+        data[0..4].copy_from_slice(&1234i32.to_le_bytes());
+        // tgid = 5678
+        data[4..8].copy_from_slice(&5678i32.to_le_bytes());
+        // timestamp = 123456789
+        data[8..16].copy_from_slice(&123456789u64.to_le_bytes());
+        // enter = 1
+        data[16] = 1;
+
+        let event = SigwaitEvent::from_bytes(&data).expect("Failed to parse event");
+        assert_eq!(event.pid, 1234);
+        assert_eq!(event.tgid, 5678);
+        assert_eq!(event.timestamp, 123456789);
+        assert_eq!(event.enter, 1);
+    }
+
+    #[test]
+    fn test_sigwait_event_from_bytes_insufficient_data() {
+        // Provide insufficient bytes
+        let data = vec![0u8; 10];
+        let result = SigwaitEvent::from_bytes(&data);
+        assert!(result.is_none(), "Should return None for insufficient data");
+    }
+
+    #[test]
+    fn test_schedstat_event_from_bytes_valid() {
+        // Create raw bytes representing a SchedstatEvent
+        let mut data = vec![0u8; 32];
+        // pid = 9999
+        data[0..4].copy_from_slice(&9999i32.to_le_bytes());
+        // cpu = 3
+        data[4..8].copy_from_slice(&3i32.to_le_bytes());
+        // ts_wakeup = 1000
+        data[8..16].copy_from_slice(&1000u64.to_le_bytes());
+        // ts_start = 2000
+        data[16..24].copy_from_slice(&2000u64.to_le_bytes());
+        // ts_stop = 3000
+        data[24..32].copy_from_slice(&3000u64.to_le_bytes());
+
+        let event = SchedstatEvent::from_bytes(&data).expect("Failed to parse event");
+        assert_eq!(event.pid, 9999);
+        assert_eq!(event.cpu, 3);
+        assert_eq!(event.ts_wakeup, 1000);
+        assert_eq!(event.ts_start, 2000);
+        assert_eq!(event.ts_stop, 3000);
+    }
+
+    #[test]
+    fn test_schedstat_event_from_bytes_insufficient_data() {
+        // Provide insufficient bytes
+        let data = vec![0u8; 20];
+        let result = SchedstatEvent::from_bytes(&data);
+        assert!(result.is_none(), "Should return None for insufficient data");
+    }
+
+    #[test]
+    fn test_sigwait_event_enter_exit_values() {
+        // Test enter=0 (exit)
+        let mut data = vec![0u8; 24];
+        data[16] = 0; // enter = 0
+        let event = SigwaitEvent::from_bytes(&data).unwrap();
+        assert_eq!(event.enter, 0);
+
+        // Test enter=1 (enter)
+        data[16] = 1;
+        let event = SigwaitEvent::from_bytes(&data).unwrap();
+        assert_eq!(event.enter, 1);
+    }
 }
