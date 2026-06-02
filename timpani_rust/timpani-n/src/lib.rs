@@ -197,6 +197,9 @@ pub async fn run_app(config: Config) -> TimpaniResult<()> {
     ctx.runtime.sync_start = sync_start;
     ctx.comm.node_client = Some(client);
 
+    // 6.5. Initialize BPF monitoring (after schedule is available, before task init)
+    ctx.init_bpf_monitoring()?;
+
     // 6b. Start RT loop — spawn per-task timer tasks + hyperperiod cycle task.
     //     Mirrors start_timers() in core.c.
     let start_at = core::compute_start_at(ctx.runtime.sync_start.as_ref());

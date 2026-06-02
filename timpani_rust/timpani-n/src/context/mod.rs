@@ -6,6 +6,7 @@
 use std::time::Instant;
 
 use crate::config::Config;
+use crate::core::BpfManager;
 use crate::grpc::NodeClient;
 use crate::sched::{set_affinity, set_schedattr, SchedPolicy};
 use crate::task::TimeTrigger;
@@ -240,6 +241,9 @@ pub struct Context {
 
     /// Hyperperiod manager
     pub hp_manager: HyperperiodManager,
+
+    /// BPF monitoring manager
+    pub bpf_manager: BpfManager,
 }
 
 impl Context {
@@ -247,6 +251,7 @@ impl Context {
     pub fn new(config: Config) -> Self {
         Context {
             config,
+            bpf_manager: BpfManager::new(),
             runtime: RuntimeState::default(),
             comm: CommState::default(),
             hp_manager: HyperperiodManager::default(),
@@ -300,13 +305,69 @@ impl Context {
         Ok(())
     }
 
+    /// Initialize BPF monitoring with event callbacks
+    ///
+    /// This should be called after schedule info is received and before
+    /// task initialization begins.
+    pub fn init_bpf_monitoring(&mut self) -> crate::error::TimpaniResult<()> {
+        use crate::core::{bpf_ktime_to_realtime, SchedstatCallback, SigwaitCallback};
+        use std::sync::Arc;
+
+        info!("Initializing BPF monitoring...");
+
+        // Define sigwait event callback
+        // This callback is invoked from the BPF ring buffer polling thread
+        // whenever a sigwait enter/exit event occurs
+        let sigwait_cb: SigwaitCallback = Arc::new(move |event| {
+            let rt_ts = bpf_ktime_to_realtime(event.timestamp);
+            let event_type = if event.enter != 0 { "ENTER" } else { "EXIT" };
+            tracing::trace!(
+                "Sigwait {}: PID={}, TGID={}, ts={}.{:09}",
+                event_type,
+                event.pid,
+                event.tgid,
+                rt_ts / 1_000_000_000,
+                rt_ts % 1_000_000_000
+            );
+            // TODO: Add actual deadline tracking logic here when task module is ready
+        });
+
+        // Define schedstat event callback (for plot feature)
+        // This callback processes scheduler statistics for plotting
+        let schedstat_cb: SchedstatCallback = Arc::new(move |event| {
+            let rt_wakeup = bpf_ktime_to_realtime(event.ts_wakeup);
+            let rt_start = bpf_ktime_to_realtime(event.ts_start);
+            let rt_stop = bpf_ktime_to_realtime(event.ts_stop);
+            tracing::trace!(
+                "Schedstat: PID={}, CPU={}, wakeup={}.{:09}, start={}.{:09}, stop={}.{:09}",
+                event.pid,
+                event.cpu,
+                rt_wakeup / 1_000_000_000,
+                rt_wakeup % 1_000_000_000,
+                rt_start / 1_000_000_000,
+                rt_start % 1_000_000_000,
+                rt_stop / 1_000_000_000,
+                rt_stop % 1_000_000_000
+            );
+            // TODO: Add plot file writing logic here when plot feature is implemented
+        });
+
+        // Start BPF monitoring
+        self.bpf_manager.bpf_on(sigwait_cb, schedstat_cb)?;
+
+        Ok(())
+    }
+
     /// Cleanup resources (placeholder for future cleanup logic)
     pub fn cleanup(&mut self) {
         // TODO: Add cleanup logic as we port more modules:
         // - cleanup time triggers
-        // - cleanup BPF resources
         // - cleanup network connections
         // - cleanup hyperperiod manager
+
+        // Stop BPF monitoring
+        info!("Stopping BPF monitoring...");
+        self.bpf_manager.bpf_off();
     }
 }
 
@@ -490,5 +551,58 @@ mod tests {
             vec![make_task("t1", 5_000), make_task("t2", 10_000)],
         );
         assert_eq!(a.task_count(), 2);
+    }
+
+    #[test]
+    fn test_hyperperiod_manager_record_deadline_miss() {
+        let mut hp = HyperperiodManager::init("test-wl", 100_000, 2);
+        assert_eq!(hp.total_deadline_misses, 0);
+        assert_eq!(hp.cycle_deadline_misses, 0);
+
+        hp.record_deadline_miss();
+        assert_eq!(hp.total_deadline_misses, 1);
+        assert_eq!(hp.cycle_deadline_misses, 1);
+
+        hp.record_deadline_miss();
+        assert_eq!(hp.total_deadline_misses, 2);
+        assert_eq!(hp.cycle_deadline_misses, 2);
+    }
+
+    #[test]
+    fn test_hyperperiod_manager_on_cycle_complete_resets_cycle_misses() {
+        let mut hp = HyperperiodManager::init("test-wl", 100_000, 2);
+
+        hp.record_deadline_miss();
+        hp.record_deadline_miss();
+        assert_eq!(hp.cycle_deadline_misses, 2);
+        assert_eq!(hp.completed_cycles, 0);
+
+        hp.on_cycle_complete();
+        assert_eq!(hp.cycle_deadline_misses, 0); // Reset
+        assert_eq!(hp.total_deadline_misses, 2); // Preserved
+        assert_eq!(hp.completed_cycles, 1);
+        assert_eq!(hp.current_cycle, 1);
+    }
+
+    #[test]
+    fn test_hyperperiod_manager_log_statistics_with_zero_cycles() {
+        let hp = HyperperiodManager::init("test-wl", 100_000, 2);
+        // Should not panic with zero completed_cycles
+        hp.log_statistics();
+    }
+
+    #[test]
+    fn test_hyperperiod_manager_log_statistics_with_data() {
+        let mut hp = HyperperiodManager::init("test-wl", 100_000, 2);
+        hp.record_deadline_miss();
+        hp.on_cycle_complete();
+        hp.record_deadline_miss();
+        hp.record_deadline_miss();
+        hp.on_cycle_complete();
+
+        // Should log with calculated miss rate
+        hp.log_statistics();
+        assert_eq!(hp.total_deadline_misses, 3);
+        assert_eq!(hp.completed_cycles, 2);
     }
 }
