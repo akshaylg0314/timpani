@@ -140,10 +140,11 @@ timpani/
 ```
 ## How to Get Involved
 
-To contribute this project, please join the conversation.
-- [Weekly meeting link (MS Teams)](https://teams.microsoft.com/meet/46052781724289?p=v7AILMRZryXY01ApNs)
+To contribute to this project, please review the contribution guidelines and join the conversation.
+- [Contribution guidelines](doc/contribution/guidelines-en.md)
+- [Weekly meeting (Microsoft Teams)](https://teams.microsoft.com/meet/46052781724289?p=v7AILMRZryXY01ApNs)
 
-Please leave your agenda before joining the meeting.
+Before joining the meeting, please add your agenda items:
 - [Meeting Agenda](https://github.com/eclipse-timpani/timpani/discussions/137)
 
 
