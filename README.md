@@ -144,8 +144,8 @@ To contribute to this project, please review the contribution guidelines and joi
 - [Contribution guidelines](doc/contribution/guidelines-en.md)
 - [Weekly meeting (Microsoft Teams)](https://teams.microsoft.com/meet/46052781724289?p=v7AILMRZryXY01ApNs)
 
-Before joining the meeting, please add your agenda items:
-- [Meeting Agenda](https://github.com/eclipse-timpani/timpani/discussions/137)
+Meeting minutes and announcements are posted here:
+- [Meeting minutes (2026)](https://github.com/eclipse-timpani/timpani/discussions/137)
 
 
 ---
