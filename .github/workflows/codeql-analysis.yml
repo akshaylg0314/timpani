@@ -67,6 +67,21 @@ jobs:
           libdbus-1-dev \
           libsystemd-dev \
           libgtest-dev
+        # Try to install bpftool from package
+        sudo apt-get install -y linux-tools-generic || true
+
+    # Ensure bpftool is available - build from source if needed
+    - name: Install bpftool
+      run: |
+        if ! command -v bpftool &> /dev/null; then
+          echo "bpftool not found in system, building from source..."
+          git clone --recurse-submodules https://github.com/libbpf/bpftool.git
+          cd bpftool/src
+          make
+          sudo make install
+          cd ../..
+        fi
+        bpftool version
 
     # Build timpani-n (C code)
     - name: Build timpani-n
