@@ -4,6 +4,7 @@
 name: "CodeQL Analysis with MISRA"
 
 on:
+  workflow_call:
   push:
     branches: [ "main", "development_0.5" ]
   pull_request:
@@ -61,6 +62,7 @@ jobs:
           protobuf-compiler \
           libprotobuf-dev \
           libdbus-1-dev \
+          libsystemd-dev \
           libgtest-dev
 
     # Build timpani-n (C code)
