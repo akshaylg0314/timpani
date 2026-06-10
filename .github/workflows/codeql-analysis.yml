@@ -117,13 +117,5 @@ jobs:
       uses: github/codeql-action/analyze@v4
       with:
         category: "/language:${{matrix.language}}"
-        # Upload SARIF results
+        # Upload SARIF results to GitHub Security tab
         upload: true
-
-    # Optional: Upload SARIF file as artifact for local review
-    - name: Upload SARIF as Artifact
-      uses: actions/upload-artifact@v4
-      if: always()
-      with:
-        name: codeql-sarif-${{ matrix.language }}
-        path: /home/runner/work/_temp/codeql_databases/**/*.sarif
