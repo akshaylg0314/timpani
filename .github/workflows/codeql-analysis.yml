@@ -126,4 +126,4 @@ jobs:
       if: always()
       with:
         name: codeql-sarif-${{ matrix.language }}
-        path: ../results/*.sarif
+        path: /home/runner/work/_temp/codeql_databases/**/*.sarif
