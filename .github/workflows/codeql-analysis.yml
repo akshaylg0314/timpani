@@ -63,6 +63,9 @@ jobs:
           linux-tools-$(uname -r) \
           pkg-config \
           protobuf-compiler \
+          protobuf-compiler-grpc \
+          libgrpc-dev \
+          libgrpc++-dev \
           libprotobuf-dev \
           libdbus-1-dev \
           libsystemd-dev \
