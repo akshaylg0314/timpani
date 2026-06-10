@@ -58,6 +58,9 @@ jobs:
           zlib1g-dev \
           libbpf-dev \
           linux-headers-$(uname -r) \
+          linux-tools-common \
+          linux-tools-generic \
+          linux-tools-$(uname -r) \
           pkg-config \
           protobuf-compiler \
           libprotobuf-dev \
