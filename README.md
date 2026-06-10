@@ -138,7 +138,14 @@ timpani/
     └── timpani-o/
         └── README.md           # Rust node scheduler (in development)
 ```
+## How to Get Involved
 
+To contribute to this project, please review the contribution guidelines and join the conversation.
+- [Contribution guidelines](doc/contribution/guidelines-en.md)
+- [Weekly meeting (Microsoft Teams)](https://teams.microsoft.com/meet/46052781724289?p=v7AILMRZryXY01ApNs)
+
+Meeting minutes and announcements are posted here:
+- [Meeting minutes (2026)](https://github.com/eclipse-timpani/timpani/discussions/137)
 
 
 ---
