@@ -1,0 +1,70 @@
+# SPDX-FileCopyrightText: Copyright 2026 LG Electronics Inc.
+# SPDX-License-Identifier: MIT
+
+# MISRA Query Suite for Timpani
+# This suite includes specific MISRA C:2012 and MISRA C++:2008 rules
+
+- description: MISRA C and C++ Compliance Queries
+- queries: .
+- apply: suite-misra-queries
+  from: codeql/cpp-queries
+  version: latest
+
+- include:
+    kind:
+      - problem
+      - path-problem
+    tags contain:
+      - security
+      - correctness
+      - maintainability
+
+# Specific MISRA C:2012 Rules
+- include:
+    tags contain: misra-c
+
+# Specific MISRA C++:2008 Rules  
+- include:
+    tags contain: misra-cpp
+
+# Common MISRA-related queries
+- include:
+    id:
+      # MISRA C Rule 21.3 - Memory allocation functions
+      - cpp/misra/memory-allocation
+      # MISRA C Rule 17.7 - Return value check
+      - cpp/misra/return-value-ignored
+      # MISRA C Rule 8.9 - Object scope minimization
+      - cpp/misra/object-scope
+      # Pointer arithmetic (MISRA C Rule 18.4)
+      - cpp/pointer-arithmetic
+      # Type conversions (MISRA C Rule 10.x)
+      - cpp/suspicious-pointer-scaling
+      - cpp/implicit-bitfield-downcast
+      # Dead code (MISRA C Rule 2.1)
+      - cpp/dead-code/unreachable-code
+      - cpp/dead-code/unused-local-variable
+      # Control flow (MISRA C Rule 15.x)
+      - cpp/missing-return
+      - cpp/conditionally-uninitialized-variable
+      # Null pointer dereference
+      - cpp/null-pointer-dereference
+      # Buffer overflow
+      - cpp/overflowing-snprintf
+      - cpp/tainted-format-string
+      # Integer overflow
+      - cpp/integer-multiplication-cast-to-long
+      - cpp/signed-overflow-check
+      # Resource management
+      - cpp/resource-not-released-in-destructor
+      - cpp/use-after-free
+      - cpp/double-free
+      # Undefined behavior
+      - cpp/undefined-behaviour
+      - cpp/comparison-with-wider-type
+
+# Additional security and quality queries
+- include:
+    tags contain:
+      - security
+      - reliability

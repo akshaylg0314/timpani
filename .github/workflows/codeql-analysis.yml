@@ -1,0 +1,107 @@
+# SPDX-FileCopyrightText: Copyright 2026 LG Electronics Inc.
+# SPDX-License-Identifier: MIT
+
+name: "CodeQL Analysis with MISRA"
+
+on:
+  push:
+    branches: [ "main", "develop" ]
+  pull_request:
+    branches: [ "main", "develop" ]
+  schedule:
+    # Run at 02:00 UTC every Monday
+    - cron: '0 2 * * 1'
+  workflow_dispatch:
+
+jobs:
+  analyze:
+    name: Analyze C/C++ Code
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [ 'cpp' ]
+        # CodeQL supports [ 'cpp', 'csharp', 'go', 'java', 'javascript', 'python', 'ruby' ]
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    # Initialize CodeQL tools for scanning
+    - name: Initialize CodeQL
+      uses: github/codeql-action/init@v3
+      with:
+        languages: ${{ matrix.language }}
+        # Use custom queries including MISRA rules
+        config-file: ./.github/codeql/codeql-config.yml
+        # You can also specify queries directly:
+        # queries: security-extended,security-and-quality
+
+    # Install dependencies needed for building timpani
+    - name: Install Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential \
+          cmake \
+          clang \
+          llvm \
+          libelf-dev \
+          zlib1g-dev \
+          libbpf-dev \
+          linux-headers-$(uname -r) \
+          pkg-config \
+          protobuf-compiler \
+          libprotobuf-dev \
+          libdbus-1-dev \
+          libgtest-dev
+
+    # Build timpani-n (C code)
+    - name: Build timpani-n
+      run: |
+        cd timpani-n
+        mkdir -p build
+        cd build
+        cmake -DCMAKE_BUILD_TYPE=Debug ..
+        make -j$(nproc)
+
+    # Build timpani-o (C++ code)
+    - name: Build timpani-o
+      run: |
+        cd timpani-o
+        mkdir -p build
+        cd build
+        cmake -DCMAKE_BUILD_TYPE=Debug ..
+        make -j$(nproc)
+
+    # Build libtrpc
+    - name: Build libtrpc
+      run: |
+        cd libtrpc
+        mkdir -p build
+        cd build
+        cmake -DCMAKE_BUILD_TYPE=Debug ..
+        make -j$(nproc)
+
+    # Perform CodeQL Analysis
+    - name: Perform CodeQL Analysis
+      uses: github/codeql-action/analyze@v3
+      with:
+        category: "/language:${{matrix.language}}"
+        # Upload SARIF results
+        upload: true
+
+    # Optional: Upload SARIF file as artifact for local review
+    - name: Upload SARIF as Artifact
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: codeql-sarif-${{ matrix.language }}
+        path: ../results/*.sarif

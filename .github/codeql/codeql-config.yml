@@ -1,0 +1,52 @@
+# SPDX-FileCopyrightText: Copyright 2026 LG Electronics Inc.
+# SPDX-License-Identifier: MIT
+
+# CodeQL Configuration for Timpani Project
+# This configuration includes MISRA C/C++ rules and security queries
+
+name: "Timpani CodeQL Config"
+
+# Disable default queries and use custom query suites
+disable-default-queries: false
+
+# Query suites to run
+queries:
+  - name: MISRA C 2012 Rules
+    uses: security-extended
+  - name: MISRA C++ Rules  
+    uses: security-and-quality
+  # Additional custom queries for MISRA compliance
+  - name: Custom MISRA Queries
+    uses: ./.github/codeql/queries/misra-suite.qls
+
+# Paths to analyze
+paths:
+  - timpani-n/src
+  - timpani-o/src
+  - libtrpc/src
+  - sample-apps/src
+
+# Paths to ignore
+paths-ignore:
+  - '**/test/**'
+  - '**/tests/**'
+  - '**/build/**'
+  - '**/target/**'
+  - '**/*.md'
+  - '**/examples/**'
+  - 'timpani_rust/**'  # Rust code analyzed separately
+
+# Query filters - customize based on your needs
+query-filters:
+  - exclude:
+      # Exclude specific query IDs if needed
+      # Example: id: cpp/path-injection
+      tags:
+        - experimental
+
+# Additional configuration
+packs:
+  # Include MISRA coding standard packs
+  cpp:
+    - codeql/cpp-queries
+    - codeql/cpp-all
