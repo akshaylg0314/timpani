@@ -3,24 +3,93 @@
  * SPDX-License-Identifier: MIT
  */
 
+use std::time::Instant;
+
 use crate::config::Config;
+use crate::core::BpfManager;
 use crate::grpc::NodeClient;
 use crate::sched::{set_affinity, set_schedattr, SchedPolicy};
+use crate::task::TimeTrigger;
 use nix::unistd::Pid;
 use tracing::{info, warn};
 
-/// Scheduling information received from Timpani-O at startup via GetSchedInfo.
+/// Static scheduling parameters for one task, received from Timpani-O.
 ///
-/// This is a domain type (no proto dependency).  The full task list lives here
-/// temporarily until the task module is implemented and owns it.
+/// Pure domain type — no proto dependency, no runtime state (pid, pidfd).
+/// Those are added by the task module during `init_task_list`.
+///
+/// Mirrors `struct task_info` from schedinfo.h, minus the runtime fields.
+/// Will move to `task/mod.rs` when that module is implemented.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TaskInfo {
+    /// Task name.  Certain conversion helpers (e.g. `task_from_proto`) may truncate
+    /// this to at most 16 chars (`TINFO_NAME_MAX`), but `TaskInfo` itself does not
+    /// enforce that limit.
+    pub name: String,
+    /// Linux scheduling policy (0 = NORMAL, 1 = FIFO, 2 = RR).
+    pub sched_policy: u32,
+    /// Linux real-time scheduling priority (0 for NORMAL, 1–99 for FIFO/RR).
+    pub sched_priority: u32,
+    /// Task period in microseconds.
+    pub period_us: u32,
+    /// Release time offset within the hyperperiod, in microseconds.
+    pub release_time_us: u32,
+    /// Worst-case execution time budget in microseconds.
+    pub runtime_us: u32,
+    /// Relative deadline in microseconds.
+    pub deadline_us: u32,
+    /// CPU affinity bitmask (same bit layout as Linux cpu_set_t).
+    pub cpu_affinity: u64,
+    /// Maximum allowable deadline misses before a fault is reported.
+    pub max_dmiss: u32,
+}
+
+/// Scheduling information received from Timpani-O via GetSchedInfo.
+///
+/// This is a domain type (no proto dependency).  Versioned client-side via
+/// `received_at`: Timpani-N polls GetSchedInfo periodically and compares
+/// content (excluding `received_at`) to detect workload changes.
 #[derive(Debug)]
 pub struct SchedInfo {
-    /// Workload identifier string from Timpani-O.
+    /// Workload identifier.  A change here means full workload replacement.
     pub workload_id: String,
     /// Hyperperiod in microseconds.
     pub hyperperiod_us: u64,
-    /// Number of tasks assigned to this node.
-    pub task_count: usize,
+    /// Tasks assigned to this node.
+    pub tasks: Vec<TaskInfo>,
+    /// Wall-clock time when this schedule version was fetched from Timpani-O.
+    /// Used for logging and staleness tracking only.  Excluded from PartialEq.
+    pub received_at: Instant,
+}
+
+impl PartialEq for SchedInfo {
+    /// Content equality — `received_at` is intentionally excluded.
+    fn eq(&self, other: &Self) -> bool {
+        self.workload_id == other.workload_id
+            && self.hyperperiod_us == other.hyperperiod_us
+            && self.tasks == other.tasks
+    }
+}
+
+impl SchedInfo {
+    /// Returns `true` if the schedule content differs from `other`.
+    ///
+    /// `received_at` is not considered — only `workload_id`, `hyperperiod_us`,
+    /// and `tasks` participate in the comparison.
+    pub fn content_changed(&self, other: &SchedInfo) -> bool {
+        self != other
+    }
+
+    /// Returns `true` if `other` belongs to a completely new workload
+    /// (different `workload_id`) rather than an in-place update.
+    pub fn is_full_replacement(&self, other: &SchedInfo) -> bool {
+        self.workload_id != other.workload_id
+    }
+
+    /// Convenience accessor: number of tasks in this schedule.
+    pub fn task_count(&self) -> usize {
+        self.tasks.len()
+    }
 }
 
 /// Absolute start time returned by SyncTimer when the barrier releases.
@@ -43,8 +112,10 @@ pub struct RuntimeState {
     pub sched_info: Option<SchedInfo>,
     /// Barrier start time from SyncTimer.  None if enable_sync=false or sync not yet done.
     pub sync_start: Option<SyncStartTime>,
+    /// Runtime task list.  Empty until init_task_list() succeeds after GetSchedInfo.
+    /// Rebuilt on every workload change detected in the polling loop.
+    pub tt_list: Vec<TimeTrigger>,
     // TODO: Add fields as we port more modules:
-    // - tt_list (time trigger task list — task module)
     // - apex_list (Apex.OS task list — apex module)
 }
 
@@ -58,15 +129,100 @@ pub struct CommState {
     // - apex_fd (Apex.OS Monitor Socket FD)
 }
 
-/// Hyperperiod manager structure
-/// Maps to context.hp_manager from C implementation
+/// Hyperperiod statistics and cycle tracking.
+///
+/// Mirrors `struct hyperperiod_manager` from `internal.h`.  Initialized by
+/// [`HyperperiodManager::init`] just before timers start, then updated once
+/// per hyperperiod cycle by the RT loop's cycle task.
+///
+/// Deadline-miss fields are incremented by the timer callback; the cycle task
+/// resets [`cycle_deadline_misses`] on each cycle boundary.
 #[derive(Debug, Default)]
 pub struct HyperperiodManager {
-    // TODO: Add fields as we port hyperperiod module:
-    // - hyperperiod_us
-    // - current_cycle
-    // - workload_id
-    // - etc.
+    /// Workload identifier this manager was initialized for.
+    pub workload_id: String,
+    /// Hyperperiod duration in microseconds.  0 = not yet initialized.
+    pub hyperperiod_us: u64,
+    /// Total hyperperiod cycles completed since timers started.
+    pub completed_cycles: u64,
+    /// Current cycle index (incremented each cycle, matches `completed_cycles`).
+    pub current_cycle: u64,
+    /// Total deadline misses across all tasks and all cycles.
+    pub total_deadline_misses: u32,
+    /// Deadline misses within the current (most recent) cycle.
+    /// Reset to 0 on each cycle boundary by [`on_cycle_complete`].
+    pub cycle_deadline_misses: u32,
+    /// Number of tasks registered for this hyperperiod.
+    pub tasks_in_hyperperiod: u32,
+}
+
+/// Log hyperperiod statistics every N completed cycles.
+const HP_STATS_LOG_INTERVAL: u64 = 100;
+
+impl HyperperiodManager {
+    /// Initialize from a schedule received from Timpani-O.
+    pub fn init(workload_id: &str, hyperperiod_us: u64, task_count: usize) -> Self {
+        info!(
+            workload_id,
+            hyperperiod_us,
+            task_count,
+            hyperperiod_ms = hyperperiod_us as f64 / 1_000.0,
+            "HyperperiodManager initialized"
+        );
+        Self {
+            workload_id: workload_id.to_string(),
+            hyperperiod_us,
+            completed_cycles: 0,
+            current_cycle: 0,
+            total_deadline_misses: 0,
+            cycle_deadline_misses: 0,
+            tasks_in_hyperperiod: task_count as u32,
+        }
+    }
+
+    /// Called once per hyperperiod cycle (by the RT loop's cycle task).
+    ///
+    /// Advances cycle counters, resets per-cycle miss count, and logs
+    /// statistics every [`HP_STATS_LOG_INTERVAL`] cycles.
+    pub fn on_cycle_complete(&mut self) {
+        self.completed_cycles += 1;
+        self.current_cycle = self.completed_cycles;
+        self.cycle_deadline_misses = 0;
+        if self.completed_cycles % HP_STATS_LOG_INTERVAL == 0 {
+            self.log_statistics();
+        }
+    }
+
+    /// Record one deadline miss for the current cycle.
+    ///
+    /// Called by the timer callback when BPF-based deadline-miss detection
+    /// is enabled.  For now this is a counter-only hook; the BPF module will
+    /// call this when it detects a task overrun.
+    pub fn record_deadline_miss(&mut self) {
+        self.total_deadline_misses += 1;
+        self.cycle_deadline_misses += 1;
+    }
+
+    /// Log hyperperiod statistics at INFO level.
+    ///
+    /// Mirrors `log_hyperperiod_statistics()` from `hyperperiod.c`.
+    pub fn log_statistics(&self) {
+        let miss_rate = if self.completed_cycles > 0 {
+            self.total_deadline_misses as f64 / self.completed_cycles as f64
+        } else {
+            0.0
+        };
+        info!(
+            workload    = %self.workload_id,
+            cycles      = self.completed_cycles,
+            hp_us       = self.hyperperiod_us,
+            total_miss  = self.total_deadline_misses,
+            cycle_miss  = self.cycle_deadline_misses,
+            miss_rate   = format_args!("{:.4}", miss_rate),
+            tasks       = self.tasks_in_hyperperiod,
+            "=== Hyperperiod statistics ==="
+        );
+    }
 }
 
 /// Main context structure for Timpani-N
@@ -85,6 +241,9 @@ pub struct Context {
 
     /// Hyperperiod manager
     pub hp_manager: HyperperiodManager,
+
+    /// BPF monitoring manager
+    pub bpf_manager: BpfManager,
 }
 
 impl Context {
@@ -92,6 +251,7 @@ impl Context {
     pub fn new(config: Config) -> Self {
         Context {
             config,
+            bpf_manager: BpfManager::new(),
             runtime: RuntimeState::default(),
             comm: CommState::default(),
             hp_manager: HyperperiodManager::default(),
@@ -145,19 +305,76 @@ impl Context {
         Ok(())
     }
 
+    /// Initialize BPF monitoring with event callbacks
+    ///
+    /// This should be called after schedule info is received and before
+    /// task initialization begins.
+    pub fn init_bpf_monitoring(&mut self) -> crate::error::TimpaniResult<()> {
+        use crate::core::{bpf_ktime_to_realtime, SchedstatCallback, SigwaitCallback};
+        use std::sync::Arc;
+
+        info!("Initializing BPF monitoring...");
+
+        // Define sigwait event callback
+        // This callback is invoked from the BPF ring buffer polling thread
+        // whenever a sigwait enter/exit event occurs
+        let sigwait_cb: SigwaitCallback = Arc::new(move |event| {
+            let rt_ts = bpf_ktime_to_realtime(event.timestamp);
+            let event_type = if event.enter != 0 { "ENTER" } else { "EXIT" };
+            tracing::trace!(
+                "Sigwait {}: PID={}, TGID={}, ts={}.{:09}",
+                event_type,
+                event.pid,
+                event.tgid,
+                rt_ts / 1_000_000_000,
+                rt_ts % 1_000_000_000
+            );
+            // TODO: Add actual deadline tracking logic here when task module is ready
+        });
+
+        // Define schedstat event callback (for plot feature)
+        // This callback processes scheduler statistics for plotting
+        let schedstat_cb: SchedstatCallback = Arc::new(move |event| {
+            let rt_wakeup = bpf_ktime_to_realtime(event.ts_wakeup);
+            let rt_start = bpf_ktime_to_realtime(event.ts_start);
+            let rt_stop = bpf_ktime_to_realtime(event.ts_stop);
+            tracing::trace!(
+                "Schedstat: PID={}, CPU={}, wakeup={}.{:09}, start={}.{:09}, stop={}.{:09}",
+                event.pid,
+                event.cpu,
+                rt_wakeup / 1_000_000_000,
+                rt_wakeup % 1_000_000_000,
+                rt_start / 1_000_000_000,
+                rt_start % 1_000_000_000,
+                rt_stop / 1_000_000_000,
+                rt_stop % 1_000_000_000
+            );
+            // TODO: Add plot file writing logic here when plot feature is implemented
+        });
+
+        // Start BPF monitoring
+        self.bpf_manager.bpf_on(sigwait_cb, schedstat_cb)?;
+
+        Ok(())
+    }
+
     /// Cleanup resources (placeholder for future cleanup logic)
     pub fn cleanup(&mut self) {
         // TODO: Add cleanup logic as we port more modules:
         // - cleanup time triggers
-        // - cleanup BPF resources
         // - cleanup network connections
         // - cleanup hyperperiod manager
+
+        // Stop BPF monitoring
+        info!("Stopping BPF monitoring...");
+        self.bpf_manager.bpf_off();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     #[test]
     fn test_context_creation() {
@@ -263,5 +480,129 @@ mod tests {
             Err(e) => panic!("Unexpected error: {:?}", e),
         }
         ctx.cleanup();
+    }
+
+    fn make_task(name: &str, period_us: u32) -> TaskInfo {
+        TaskInfo {
+            name: name.chars().take(16).collect(),
+            sched_policy: 2,
+            sched_priority: 50,
+            period_us,
+            release_time_us: 0,
+            runtime_us: 1000,
+            deadline_us: period_us,
+            cpu_affinity: 0x1,
+            max_dmiss: 0,
+        }
+    }
+
+    fn make_sched(workload_id: &str, tasks: Vec<TaskInfo>) -> SchedInfo {
+        SchedInfo {
+            workload_id: workload_id.to_string(),
+            hyperperiod_us: 100_000,
+            tasks,
+            received_at: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn test_sched_info_equal_content_different_received_at() {
+        let task = make_task("task_a", 10_000);
+        let a = make_sched("wl-1", vec![task.clone()]);
+        // Simulate a later fetch: same content, different received_at.
+        let b = SchedInfo {
+            workload_id: a.workload_id.clone(),
+            hyperperiod_us: a.hyperperiod_us,
+            tasks: a.tasks.clone(),
+            received_at: Instant::now(),
+        };
+        assert_eq!(a, b, "Same content => equal regardless of received_at");
+        assert!(!a.content_changed(&b), "No content change expected");
+    }
+
+    #[test]
+    fn test_sched_info_content_changed_task_param() {
+        let a = make_sched("wl-1", vec![make_task("task_a", 10_000)]);
+        // Same workload_id, but period_us changed.
+        let b = make_sched("wl-1", vec![make_task("task_a", 20_000)]);
+        assert_ne!(a, b);
+        assert!(a.content_changed(&b), "period_us change must be detected");
+        assert!(
+            !a.is_full_replacement(&b),
+            "Same workload_id is not a replacement"
+        );
+    }
+
+    #[test]
+    fn test_sched_info_full_replacement() {
+        let a = make_sched("wl-1", vec![make_task("task_a", 10_000)]);
+        let b = make_sched("wl-2", vec![make_task("task_b", 10_000)]);
+        assert!(a.content_changed(&b));
+        assert!(
+            a.is_full_replacement(&b),
+            "Different workload_id is a full replacement"
+        );
+    }
+
+    #[test]
+    fn test_sched_info_task_count() {
+        let a = make_sched(
+            "wl-1",
+            vec![make_task("t1", 5_000), make_task("t2", 10_000)],
+        );
+        assert_eq!(a.task_count(), 2);
+    }
+
+    #[test]
+    fn test_hyperperiod_manager_record_deadline_miss() {
+        let mut hp = HyperperiodManager::init("test-wl", 100_000, 2);
+        assert_eq!(hp.total_deadline_misses, 0);
+        assert_eq!(hp.cycle_deadline_misses, 0);
+
+        hp.record_deadline_miss();
+        assert_eq!(hp.total_deadline_misses, 1);
+        assert_eq!(hp.cycle_deadline_misses, 1);
+
+        hp.record_deadline_miss();
+        assert_eq!(hp.total_deadline_misses, 2);
+        assert_eq!(hp.cycle_deadline_misses, 2);
+    }
+
+    #[test]
+    fn test_hyperperiod_manager_on_cycle_complete_resets_cycle_misses() {
+        let mut hp = HyperperiodManager::init("test-wl", 100_000, 2);
+
+        hp.record_deadline_miss();
+        hp.record_deadline_miss();
+        assert_eq!(hp.cycle_deadline_misses, 2);
+        assert_eq!(hp.completed_cycles, 0);
+
+        hp.on_cycle_complete();
+        assert_eq!(hp.cycle_deadline_misses, 0); // Reset
+        assert_eq!(hp.total_deadline_misses, 2); // Preserved
+        assert_eq!(hp.completed_cycles, 1);
+        assert_eq!(hp.current_cycle, 1);
+    }
+
+    #[test]
+    fn test_hyperperiod_manager_log_statistics_with_zero_cycles() {
+        let hp = HyperperiodManager::init("test-wl", 100_000, 2);
+        // Should not panic with zero completed_cycles
+        hp.log_statistics();
+    }
+
+    #[test]
+    fn test_hyperperiod_manager_log_statistics_with_data() {
+        let mut hp = HyperperiodManager::init("test-wl", 100_000, 2);
+        hp.record_deadline_miss();
+        hp.on_cycle_complete();
+        hp.record_deadline_miss();
+        hp.record_deadline_miss();
+        hp.on_cycle_complete();
+
+        // Should log with calculated miss rate
+        hp.log_statistics();
+        assert_eq!(hp.total_deadline_misses, 3);
+        assert_eq!(hp.completed_cycles, 2);
     }
 }
