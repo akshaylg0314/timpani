@@ -74,7 +74,8 @@ jobs:
         git clone --depth 1 --recurse-submodules https://github.com/libbpf/bpftool.git
         cd bpftool/src
         make -j$(nproc)
-        sudo cp bpftool /usr/bin/bpftool
+        # Replace the non-functional wrapper in /usr/sbin
+        sudo cp bpftool /usr/sbin/bpftool
         cd ../..
         rm -rf bpftool
         # Verify installation
