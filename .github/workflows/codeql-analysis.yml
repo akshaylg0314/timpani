@@ -5,9 +5,9 @@ name: "CodeQL Analysis with MISRA"
 
 on:
   push:
-    branches: [ "main", "develop" ]
+    branches: [ "main", "development_0.5" ]
   pull_request:
-    branches: [ "main", "develop" ]
+    branches: [ "main", "development_0.5" ]
   schedule:
     # Run at 02:00 UTC every Monday
     - cron: '0 2 * * 1'
