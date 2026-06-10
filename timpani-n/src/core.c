@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: MIT
  */
 
-#include <stdatomic.h> // atomic operations
+#include <stdatomic.h> // atomic operation
 
 #include "internal.h"
 

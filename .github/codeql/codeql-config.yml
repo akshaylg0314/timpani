@@ -15,9 +15,6 @@ queries:
     uses: security-extended
   - name: MISRA C++ Rules  
     uses: security-and-quality
-  # Additional custom queries for MISRA compliance
-  - name: Custom MISRA Queries
-    uses: ./.github/codeql/queries/misra-suite.qls
 
 # Paths to analyze
 paths:

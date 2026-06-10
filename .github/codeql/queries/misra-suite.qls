@@ -8,7 +8,6 @@
 - queries: .
 - apply: suite-misra-queries
   from: codeql/cpp-queries
-  version: latest
 
 - include:
     kind:

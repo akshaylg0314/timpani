@@ -21,6 +21,7 @@ jobs:
       rust_changed: ${{ steps.filter.outputs.rust }}  # Set to true if any Rust-relevant files changed
       doc_changed: ${{ steps.filter.outputs.docs }}   # True if docs (Markdown) changed
       yaml_changed: ${{ steps.filter.outputs.yaml }}  # True if GitHub workflow YAMLs changed
+      cpp_changed: ${{ steps.filter.outputs.cpp }}    # True if C/C++ files changed
     steps:
       # Step 1: Checkout repo contents
       - uses: actions/checkout@v4
@@ -42,6 +43,18 @@ jobs:
               - '**/*.md'         # Markdown docs (README, etc.)
             yaml:
               - '.github/workflows/*.yml'  # GitHub workflow YAMLs
+            cpp:
+              - '**/*.c'          # C source files
+              - '**/*.h'          # C header files
+              - '**/*.cpp'        # C++ source files
+              - '**/*.hpp'        # C++ header files
+              - '**/*.cc'         # Alternative C++ extension
+              - '**/CMakeLists.txt'  # CMake build files
+              - '**/*.cmake'      # CMake modules
+              - 'timpani-n/**'    # timpani-n C project
+              - 'timpani-o/**'    # timpani-o C++ project
+              - 'libtrpc/**'      # libtrpc C library
+              - 'sample-apps/**'  # sample applications
 
   #  Job 2: Trigger full Rust CI workflow if Rust files or configs changed
   run-rust-ci:
@@ -61,7 +74,17 @@ jobs:
     if: needs.detect-changes.outputs.yaml_changed == 'true'
     uses: ./.github/workflows/run-validate.yml
 
-  #  Job 5: Always run this last to print a clean summary in Actions UI
+  #  Job 5: Run CodeQL security analysis on C/C++ code if relevant files changed
+  run-codeql-analysis:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.cpp_changed == 'true'
+    uses: ./.github/workflows/codeql-analysis.yml
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+
+  #  Job 6: Always run this last to print a clean summary in Actions UI
   ci-summary:
     name: CI Complete Summary
     runs-on: ubuntu-latest
@@ -74,13 +97,16 @@ jobs:
       - run-rust-ci
       - run-doc-lint
       - run-yaml-validation
+      - run-codeql-analysis
     steps:
       - name: Report CI outcome
         run: |
           echo "rust_changed : ${{ needs.detect-changes.outputs.rust_changed }}"
           echo "doc_changed  : ${{ needs.detect-changes.outputs.doc_changed }}"
           echo "yaml_changed : ${{ needs.detect-changes.outputs.yaml_changed }}"
+          echo "cpp_changed  : ${{ needs.detect-changes.outputs.cpp_changed }}"
           echo "rust-ci      : ${{ needs.run-rust-ci.result }}"
           echo "doc-lint     : ${{ needs.run-doc-lint.result }}"
           echo "yaml-validate: ${{ needs.run-yaml-validation.result }}"
+          echo "codeql       : ${{ needs.run-codeql-analysis.result }}"
           echo "All CI jobs (if triggered) have completed."
