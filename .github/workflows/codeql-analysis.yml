@@ -119,3 +119,58 @@ jobs:
         category: "/language:${{matrix.language}}"
         # Upload SARIF results to GitHub Security tab
         upload: true
+        output: sarif-results
+
+    # Generate Severity Report
+    - name: Generate Severity Report
+      if: always()
+      run: |
+        echo "## CodeQL Analysis - Severity Report" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Language:** ${{ matrix.language }}" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        # Find SARIF files
+        SARIF_FILES=$(find sarif-results -name "*.sarif" 2>/dev/null || echo "")
+        
+        if [ -z "$SARIF_FILES" ]; then
+          echo "⚠️ No SARIF files found" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "### Findings by Severity" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Parse SARIF and count by severity
+          for sarif in $SARIF_FILES; do
+            if [ -f "$sarif" ]; then
+              ERROR_COUNT=$(grep -o '"level":"error"' "$sarif" 2>/dev/null | wc -l || echo 0)
+              WARNING_COUNT=$(grep -o '"level":"warning"' "$sarif" 2>/dev/null | wc -l || echo 0)
+              NOTE_COUNT=$(grep -o '"level":"note"' "$sarif" 2>/dev/null | wc -l || echo 0)
+              
+              echo "| Severity | Count |" >> $GITHUB_STEP_SUMMARY
+              echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+              echo "| 🔴 Error | $ERROR_COUNT |" >> $GITHUB_STEP_SUMMARY
+              echo "| ⚠️ Warning | $WARNING_COUNT |" >> $GITHUB_STEP_SUMMARY
+              echo "| 💡 Note | $NOTE_COUNT |" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              
+              TOTAL=$((ERROR_COUNT + WARNING_COUNT + NOTE_COUNT))
+              echo "**Total Issues:** $TOTAL" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              
+              # Extract top issues
+              echo "### Top Issues Found" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              
+              # Get unique rule IDs and their counts
+              grep -o '"ruleId":"[^"]*"' "$sarif" 2>/dev/null | \
+                sed 's/"ruleId":"\([^"]*\)"/\1/' | \
+                sort | uniq -c | sort -rn | head -10 | \
+                while read count rule; do
+                  echo "- **$rule**: $count occurrence(s)" >> $GITHUB_STEP_SUMMARY
+                done || echo "- No specific rules found" >> $GITHUB_STEP_SUMMARY
+            fi
+          done
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "📊 View detailed results in the [Security tab](https://github.com/${{ github.repository }}/security/code-scanning)" >> $GITHUB_STEP_SUMMARY
+        fi
